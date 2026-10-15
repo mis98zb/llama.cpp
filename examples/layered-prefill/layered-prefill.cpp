@@ -20,6 +20,8 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             pp.staging_type = std::strcmp(argv[i], "bf16") == 0 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+        } else if (std::strcmp(argv[i], "--no-pipeline") == 0) {
+            pp.pipeline = false;
         } else {
             common_args.push_back(argv[i]);
         }
@@ -32,7 +34,7 @@ int main(int argc, char ** argv) {
     const int common_argc = common_args.size();
     common_args.push_back(nullptr);
     if (!common_params_parse(common_argc, common_args.data(), params, LLAMA_EXAMPLE_COMMON,
-                            [](int, char **) { LOG("Layered prefill: --staging-type bf16|f32 (default bf16)\n"); })) {
+                            [](int, char **) { LOG("Layered prefill: --staging-type bf16|f32 (default bf16), --no-pipeline\n"); })) {
         return 1;
     }
     if (params.n_parallel != 1 || params.n_predict < 0 || params.moe_cache_size != 0 ||
@@ -85,6 +87,8 @@ int main(int argc, char ** argv) {
         LOG_INF("expert layer loads=%u, copied bytes=%" PRIu64 ", activation read/write=%" PRIu64 "/%" PRIu64
                 ", peak measured compute bytes=%zu\n", stats.expert_layer_loads, stats.expert_copy_bytes,
                 stats.activation_read_bytes, stats.activation_write_bytes, stats.peak_compute_bytes);
+        LOG_INF("pipeline=%d, transfer buffer bytes=%zu, input prefetches=%u, asynchronous output batches=%u\n",
+                stats.pipeline_active, stats.transfer_buffer_bytes, stats.input_prefetches, stats.async_output_batches);
         llama_perf_context_print(ctx.get());
         const auto * vocab = llama_model_get_vocab(model.get());
         const size_t nv = llama_vocab_n_tokens(vocab);

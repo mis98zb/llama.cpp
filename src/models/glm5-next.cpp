@@ -709,8 +709,13 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
         cb(inpL, "hc_init", -1);
     } else {
-        res->t_prefill_in = ggml_new_tensor_3d(ctx0, params.prefill_type, n_embd, hc, n_tokens);
-        ggml_set_input(res->t_prefill_in);
+        if (params.prefill_input) {
+            auto * t = params.prefill_input;
+            res->t_prefill_in = ggml_view_3d(ctx0, t, n_embd, hc, n_tokens, t->nb[1], t->nb[2], 0);
+        } else {
+            res->t_prefill_in = ggml_new_tensor_3d(ctx0, params.prefill_type, n_embd, hc, n_tokens);
+            ggml_set_input(res->t_prefill_in);
+        }
         ggml_set_name(res->t_prefill_in, "prefill_input");
         inpL = ggml_cast(ctx0, res->t_prefill_in, GGML_TYPE_F32);
     }
@@ -787,6 +792,11 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
 
     if (layered) {
         res->t_prefill_out = ggml_cast(ctx0, inpL, params.prefill_type);
+        if (params.prefill_output) {
+            auto * t = params.prefill_output;
+            auto * dst = ggml_view_3d(ctx0, t, n_embd, hc, n_tokens, t->nb[1], t->nb[2], 0);
+            res->t_prefill_out = ggml_cpy(ctx0, res->t_prefill_out, dst);
+        }
         ggml_set_name(res->t_prefill_out, "prefill_output");
         ggml_build_forward_expand(gf, res->t_prefill_out);
         if (last != n_layer || n_outputs == 0) {

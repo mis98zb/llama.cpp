@@ -27,6 +27,8 @@ struct llama_layered_prefill_params {
     size_t max_expert_bytes = size_t(6) << 30;
     size_t max_compute_bytes = size_t(8) << 30;
     bool require_gpu = true; // false enables CPU correctness testing
+    bool pipeline = true;
+    size_t max_transfer_bytes = size_t(512) << 20; // combined device and pinned activation buffers
 };
 
 struct llama_layered_prefill_stats {
@@ -36,6 +38,10 @@ struct llama_layered_prefill_stats {
     uint32_t expert_layer_loads = 0;
     uint32_t microbatches = 0;
     size_t peak_compute_bytes = 0;
+    size_t transfer_buffer_bytes = 0;
+    uint32_t input_prefetches = 0;
+    uint32_t async_output_batches = 0;
+    bool pipeline_active = false;
 };
 
 // Returns 0 on success, -1 on unsupported/invalid input, -2 on allocation/compute failure.

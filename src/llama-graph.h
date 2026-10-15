@@ -832,6 +832,8 @@ struct llm_graph_params {
     int32_t prefill_layer = -1;
     ggml_type prefill_type = GGML_TYPE_F32;
     const llama_layer * prefill_weights = nullptr;
+    ggml_tensor * prefill_input = nullptr;
+    ggml_tensor * prefill_output = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -873,7 +875,8 @@ struct llm_graph_params {
             return false;
         }
         if (prefill_layer != other.prefill_layer || prefill_type != other.prefill_type ||
-            prefill_weights != other.prefill_weights) {
+            prefill_weights != other.prefill_weights || prefill_input != other.prefill_input ||
+            prefill_output != other.prefill_output) {
             return false;
         }
 

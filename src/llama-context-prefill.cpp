@@ -4,6 +4,8 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -16,14 +18,153 @@ size_t prefill_add(size_t a, size_t b) {
     return a + b;
 }
 
+struct prefill_pipeline {
+    struct slot {
+        ggml_tensor * input = nullptr;
+        ggml_tensor * output = nullptr;
+        uint8_t * host_input = nullptr;
+        uint8_t * host_output = nullptr;
+        ggml_backend_event_ptr input_ready;
+        ggml_backend_event_ptr output_ready;
+        uint8_t * destination = nullptr;
+        size_t input_bytes = 0;
+        size_t output_bytes = 0;
+    };
+
+    ggml_backend_t compute;
+    ggml_backend_ptr upload;
+    ggml_backend_ptr download;
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr device_buffer;
+    ggml_backend_buffer_ptr host_buffer;
+    std::array<slot, 2> slots;
+
+    prefill_pipeline(ggml_backend_t backend, const llama_hparams & hp, uint32_t n_tokens,
+                     const llama_layered_prefill_params & params, size_t host_budget,
+                     llama_layered_prefill_stats & stats) : compute(backend) {
+        const auto dev = ggml_backend_get_device(backend);
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        const auto host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (!props.caps.async || !props.caps.events || !props.caps.host_buffer || !host_buft) {
+            throw std::runtime_error("layered prefill pipeline requires asynchronous copies, events and pinned host buffers");
+        }
+        const size_t row = ggml_row_size(params.staging_type, int64_t(hp.n_embd) * hp.dsv4_hc_mult);
+        if (n_tokens > host_budget / 4 / row || n_tokens > params.max_transfer_bytes / 8 / row) {
+            throw std::runtime_error("layered prefill pipeline exceeds its host or transfer buffer budget");
+        }
+        const size_t block = row * n_tokens;
+        ctx.reset(ggml_init({4 * ggml_tensor_overhead(), nullptr, true}));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate layered prefill pipeline metadata");
+        }
+        ggml_tensor * tensors[4];
+        for (size_t i = 0; i < slots.size(); ++i) {
+            auto & s = slots[i];
+            s.input = tensors[2*i] = ggml_new_tensor_3d(ctx.get(), params.staging_type,
+                                                       hp.n_embd, hp.dsv4_hc_mult, n_tokens);
+            s.output = tensors[2*i + 1] = ggml_dup_tensor(ctx.get(), s.input);
+            ggml_format_name(s.input, "prefill_pipeline.input.%zu", i);
+            ggml_format_name(s.output, "prefill_pipeline.output.%zu", i);
+            s.input_ready.reset(ggml_backend_event_new(dev));
+            s.output_ready.reset(ggml_backend_event_new(dev));
+            if (!s.input_ready || !s.output_ready) {
+                throw std::runtime_error("failed to create layered prefill transfer events");
+            }
+        }
+        const auto buft = ggml_backend_get_default_buffer_type(backend);
+        const size_t device_bytes = ggml_backend_buft_get_alloc_size_n(buft, tensors, 4);
+        if (prefill_add(device_bytes, 4*block) > params.max_transfer_bytes) {
+            throw std::runtime_error("layered prefill pipeline exceeds max_transfer_bytes");
+        }
+        device_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        host_buffer.reset(ggml_backend_buft_alloc_buffer(host_buft, 4*block));
+        if (!device_buffer || !host_buffer || ggml_backend_buffer_get_type(host_buffer.get()) != host_buft) {
+            throw std::runtime_error("failed to allocate layered prefill device or pinned staging buffers");
+        }
+        const size_t host_bytes = ggml_backend_buffer_get_size(host_buffer.get());
+        const size_t all_bytes = prefill_add(ggml_backend_buffer_get_size(device_buffer.get()), host_bytes);
+        if (host_bytes > host_budget || all_bytes > params.max_transfer_bytes) {
+            throw std::runtime_error("allocated layered prefill pipeline exceeds its budget");
+        }
+        auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(host_buffer.get()));
+        for (size_t i = 0; i < slots.size(); ++i) {
+            slots[i].host_input = base + (2*i)*block;
+            slots[i].host_output = base + (2*i + 1)*block;
+        }
+        upload.reset(ggml_backend_dev_init(dev, nullptr));
+        download.reset(ggml_backend_dev_init(dev, nullptr));
+        if (!upload || !download) {
+            throw std::runtime_error("failed to initialize layered prefill transfer streams");
+        }
+        stats.pipeline_active = true;
+        stats.transfer_buffer_bytes = all_bytes;
+    }
+
+    ~prefill_pipeline() {
+        ggml_backend_synchronize(compute);
+        if (upload) {
+            ggml_backend_synchronize(upload.get());
+        }
+        if (download) {
+            ggml_backend_synchronize(download.get());
+        }
+    }
+
+    void finish_output(size_t i) {
+        auto & s = slots[i];
+        if (s.destination) {
+            ggml_backend_event_synchronize(s.output_ready.get());
+            std::memcpy(s.destination, s.host_output, s.output_bytes);
+            s.destination = nullptr;
+        }
+    }
+
+    void prefetch_input(size_t i, const uint8_t * source, size_t bytes) {
+        auto & s = slots[i];
+        if (s.input_bytes) {
+            ggml_backend_event_synchronize(s.input_ready.get());
+        }
+        std::memcpy(s.host_input, source, bytes);
+        ggml_backend_tensor_set_async(upload.get(), s.input, s.host_input, 0, bytes);
+        ggml_backend_event_record(s.input_ready.get(), upload.get());
+        s.input_bytes = bytes;
+    }
+
+    void wait_input(size_t i, size_t bytes) {
+        auto & s = slots[i];
+        if (s.input_bytes != bytes) {
+            throw std::runtime_error("layered prefill pipeline requires consecutive fixed-size microbatches");
+        }
+        ggml_backend_event_wait(compute, s.input_ready.get());
+    }
+
+    void copy_output(size_t i, uint8_t * destination, size_t bytes) {
+        auto & s = slots[i];
+        ggml_backend_tensor_get_async(download.get(), s.output, s.host_output, 0, bytes);
+        ggml_backend_event_record(s.output_ready.get(), download.get());
+        s.destination = destination;
+        s.output_bytes = bytes;
+    }
+
+    void drain() {
+        ggml_backend_synchronize(upload.get());
+        for (size_t i = 0; i < slots.size(); ++i) {
+            finish_output(i);
+            slots[i].input_bytes = 0;
+        }
+    }
+};
+
 // Device weights outlive every microbatch graph of the current layer.
 struct prefill_experts {
+    ggml_backend_t backend;
     llama_layer layer;
     ggml_context_ptr ctx;
     ggml_backend_buffer_ptr buffer;
 
     prefill_experts(const llama_layer & source, ggml_backend_t backend, size_t budget,
-                    llama_layered_prefill_stats & stats) : layer(source) {
+                    llama_layered_prefill_stats & stats) : backend(backend), layer(source) {
         if (!source.ffn_gate_exps) {
             return;
         }
@@ -61,6 +202,10 @@ struct prefill_experts {
             stats.expert_copy_bytes += ggml_nbytes(weights[i]);
         }
         ++stats.expert_layer_loads;
+    }
+
+    ~prefill_experts() {
+        ggml_backend_synchronize(backend);
     }
 };
 
@@ -138,6 +283,7 @@ int llama_context::prefill_layered(
     if (!device) {
         device = backend_cpu;
     }
+    const bool pipelined = params.pipeline && device != backend_cpu;
 
     llama_layered_prefill_stats stats;
     bool started = false;
@@ -148,6 +294,11 @@ int llama_context::prefill_layered(
         }
         const size_t total_bytes = row_bytes * n_tokens;
         std::vector<uint8_t> input(total_bytes), output(total_bytes);
+        std::unique_ptr<prefill_pipeline> pipeline;
+        if (pipelined) {
+            pipeline = std::make_unique<prefill_pipeline>(device, hp, std::min<uint32_t>(params.n_ubatch, n_tokens),
+                                                         params, params.max_host_bytes - 2*total_bytes, stats);
+        }
         llama_batch_ext batch(this);
         for (int32_t i = 0; i < n_tokens; ++i) {
             const auto idx = batch.add_token(0);
@@ -177,8 +328,16 @@ int llama_context::prefill_layered(
             }
             prefill_experts experts(model.layers[il], device, params.max_expert_bytes, stats);
             size_t offset = 0;
+            size_t i_batch = 0;
+            if (pipeline && il > 0) {
+                pipeline->prefetch_input(0, input.data(), row_bytes * mctx->get_ubatch().n_tokens);
+            }
             do {
                 const auto & ubatch = mctx->get_ubatch();
+                const size_t slot = i_batch % 2;
+                if (pipeline) {
+                    pipeline->finish_output(slot);
+                }
                 if (!mctx->apply()) {
                     throw std::runtime_error("failed to apply layered prefill memory");
                 }
@@ -191,6 +350,10 @@ int llama_context::prefill_layered(
                 gparams.prefill_layer = il;
                 gparams.prefill_type = params.staging_type;
                 gparams.prefill_weights = &experts.layer;
+                if (pipeline) {
+                    gparams.prefill_input = il > 0 ? pipeline->slots[slot].input : nullptr;
+                    gparams.prefill_output = pipeline->slots[slot].output;
+                }
                 auto * gf = model.build_graph(gparams);
                 if (!gf) {
                     throw std::runtime_error("failed to build layered prefill graph");
@@ -217,24 +380,43 @@ int llama_context::prefill_layered(
                 res->set_inputs(&ubatch);
                 const size_t bytes = row_bytes * ubatch.n_tokens;
                 if (res->t_prefill_in) {
-                    ggml_backend_tensor_set(res->t_prefill_in, input.data() + offset * row_bytes, 0, bytes);
+                    if (pipeline) {
+                        pipeline->wait_input(slot, bytes);
+                    } else {
+                        ggml_backend_tensor_set(res->t_prefill_in, input.data() + offset * row_bytes, 0, bytes);
+                    }
                     stats.activation_read_bytes += bytes;
                 }
                 const auto status = graph_compute(gf, true);
+                const size_t next = offset + ubatch.n_tokens;
+                if (pipeline && il > 0 && next < (size_t) n_tokens && status == GGML_STATUS_SUCCESS) {
+                    const size_t next_bytes = row_bytes * std::min<size_t>(params.n_ubatch, n_tokens - next);
+                    pipeline->prefetch_input((i_batch + 1) % 2, input.data() + next * row_bytes, next_bytes);
+                    ++stats.input_prefetches;
+                }
                 synchronize();
                 if (status != GGML_STATUS_SUCCESS) {
                     throw std::runtime_error("layered prefill computation failed or was aborted");
                 }
-                ggml_backend_tensor_get(res->t_prefill_out, output.data() + offset * row_bytes, 0, bytes);
+                if (pipeline) {
+                    pipeline->copy_output(slot, output.data() + offset * row_bytes, bytes);
+                    ++stats.async_output_batches;
+                } else {
+                    ggml_backend_tensor_get(res->t_prefill_out, output.data() + offset * row_bytes, 0, bytes);
+                }
                 stats.activation_write_bytes += bytes;
                 if (n_outputs) {
                     ggml_backend_tensor_get(res->t_logits, logits.data, 0, model.vocab.n_tokens() * sizeof(float));
                 }
                 offset += ubatch.n_tokens;
                 ++stats.microbatches;
+                ++i_batch;
             } while (mctx->next());
             if (offset != (size_t) n_tokens) {
                 throw std::runtime_error("layered prefill did not consume the complete prompt");
+            }
+            if (pipeline) {
+                pipeline->drain();
             }
             ggml_backend_sched_reset(sched.get());
             for (auto & res : gf_res_prev) {

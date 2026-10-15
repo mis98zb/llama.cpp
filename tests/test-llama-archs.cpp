@@ -607,7 +607,7 @@ static bool round_prefill_boundary(ggml_tensor * tensor, bool ask, void * data) 
     return true;
 }
 
-static int test_layered_prefill(size_t seed, float stdev, const char * target_backend, bool quantized) {
+static int test_layered_prefill(size_t seed, float stdev, const char * target_backend, bool quantized, bool pipeline) {
     const auto tokens = get_tokens(137, 128, seed);
     uint64_t expected_copies = 0;
     uint32_t n_cases = 0;
@@ -655,6 +655,7 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             pp.n_ubatch = ubatch;
             pp.require_gpu = false;
             pp.staging_type = staging;
+            pp.pipeline = pipeline;
             llama_layered_prefill_stats stats;
             const llama_token invalid = 128;
             if (llama_prefill_layered(layered.get(), &invalid, 1, pp) != -1) {
@@ -678,6 +679,15 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                 throw std::runtime_error("experts were not loaded once per layer");
             }
             expected_copies = stats.expert_copy_bytes;
+            const bool gpu = !devices.empty() && ggml_backend_dev_type(devices[0]) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (stats.pipeline_active != (pipeline && gpu)) {
+                throw std::runtime_error("layered prefill pipeline was not activated as requested");
+            }
+            if (stats.pipeline_active &&
+                (stats.transfer_buffer_bytes == 0 || stats.async_output_batches != stats.microbatches ||
+                 stats.input_prefetches != 3 * ((tokens.size() + ubatch - 1) / ubatch - 1))) {
+                throw std::runtime_error("layered prefill did not pipeline all activation transfers");
+            }
             if (staging == GGML_TYPE_F32 && devices.empty()) {
                 std::vector<uint8_t> a(llama_state_seq_get_size(reference.second.get(), 0));
                 std::vector<uint8_t> b(llama_state_seq_get_size(layered.get(), 0));
@@ -714,6 +724,14 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                 throw std::runtime_error("layered prefill accepted a nonempty context");
             }
             llama_memory_clear(llama_get_memory(layered.get()), true);
+            if (stats.pipeline_active) {
+                pp.max_transfer_bytes = 1;
+                if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -2 ||
+                    llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                    throw std::runtime_error("layered prefill ignored transfer buffer budget");
+                }
+                pp.max_transfer_bytes = size_t(512) << 20;
+            }
             pp.max_host_bytes = 1;
             if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -2) {
                 throw std::runtime_error("layered prefill ignored host budget");
@@ -741,8 +759,8 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
                 throw std::runtime_error("single-token prefill after failure differs from ordinary decode");
             }
-            LOG("layered prefill: ubatch=%u staging=%s quantized=%d, logits/state/decode/budgets OK, expert bytes=%" PRIu64 "\n",
-                ubatch, ggml_type_name(staging), quantized, stats.expert_copy_bytes);
+            LOG("layered prefill: ubatch=%u staging=%s quantized=%d pipeline=%d, logits/state/decode/budgets OK, expert bytes=%" PRIu64 "\n",
+                ubatch, ggml_type_name(staging), quantized, stats.pipeline_active, stats.expert_copy_bytes);
             ++n_cases;
         }
     }
@@ -1404,8 +1422,15 @@ int main(int argc, char ** argv) {
     try {
         if (layered_prefill) {
             common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
-            const int result = test_layered_prefill(seed, stdev, target_backend, false);
-            return result != 0 ? result : test_layered_prefill(seed, stdev, target_backend, true);
+            for (bool pipeline : {false, true}) {
+                for (bool quantized : {false, true}) {
+                    const int result = test_layered_prefill(seed, stdev, target_backend, quantized, pipeline);
+                    if (result != 0) {
+                        return result;
+                    }
+                }
+            }
+            return 0;
         }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);

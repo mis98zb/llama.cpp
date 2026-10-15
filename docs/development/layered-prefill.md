@@ -73,7 +73,7 @@ CPU and CUDA builds completed with MSVC. The registered CPU test passed:
 ctest --test-dir build-prefill -R "^test-layered-prefill$" --output-on-failure
 ```
 
-The 12 precision/quantization combinations passed on CPU and on a local NVIDIA T1000 (SM75); additional seed 17 runs exercised different sparse selections. The CUDA runs used `CUDA_VISIBLE_DEVICES=2` to isolate that device and `--backend CUDA0` inside the process. CPU F32 sequence-state comparisons were byte-identical. Existing `glm5-next`, `qwen4exp` and `kimi-linear` architecture checks also passed.
+The precision/quantization combinations passed on CPU and on a local NVIDIA T1000 (SM75); additional seed 17 runs exercised different sparse selections. The activation-pipeline tests run all 12 combinations with pipelining disabled and enabled (24 cases). CPU execution retains its synchronous path. The CUDA runs used `CUDA_VISIBLE_DEVICES=2` to isolate that device and `--backend CUDA0` inside the process. CPU F32 sequence-state comparisons were byte-identical. Existing `glm5-next`, `qwen4exp` and `kimi-linear` architecture checks also passed.
 
 Across microbatches 7, 32 and 64, the miniature model copied exactly 1769472 expert bytes with F32 experts, or 663552 bytes with Q4_K experts, in three layer loads. The tests also cover invalid tokens, nonempty-context rejection, host/compute/expert budgets, cleanup and successful single-token retry after failure.
 
@@ -83,7 +83,7 @@ The standalone CUDA example loaded a locally generated tiny GGUF and completed b
 
 `llama_prefill_layered` in `src/llama-ext.h` accepts the complete tokenized prompt and returns the final token's logits through the ordinary logits getters. Sequence 0 starts at position 0. A subsequent ordinary decode starts at the prompt length. Unsupported configurations return `-1`; resource and execution failures return `-2`, with an explicit log message.
 
-The defaults are BF16 staging, microbatch 256, 16 GiB of host activation storage, 6 GiB of expert storage, and 8 GiB of scheduler compute buffers. C++ callers can set these limits through `llama_layered_prefill_params`. CPU execution requires `require_gpu = false` and is intended for correctness testing. Only one GPU is supported.
+The defaults are BF16 staging, microbatch 256, 16 GiB of host activation storage including pinned activation buffers, 6 GiB of expert storage, and 8 GiB of scheduler compute buffers. The activation pipeline has a separate 512 MiB combined device/pinned-buffer limit. C++ callers can set these limits through `llama_layered_prefill_params`. CPU execution requires `require_gpu = false` and is intended for correctness testing. Only one GPU is supported.
 
 The separate `llama-layered-prefill` example uses the shared llama.cpp argument parser, keeps routed experts in plain CPU buffers, invokes the new path, reports copy statistics and then performs greedy ordinary decode. `--staging-type f32` selects the unrounded reference; the default is `bf16`. It raises the logical batch capacity to hold the complete prompt; `-ub` remains the physical microbatch bound. It does not enable the feature in the normal CLI or server.
 
@@ -93,7 +93,23 @@ The separate `llama-layered-prefill` example uses the shared llama.cpp argument 
 
 The command requires a suitable real GGUF and is not a verified 200K/20GB configuration. Expert tensors must be contiguous, host-resident and in their ordinary GGUF layout. Repacked CPU-only expert buffers are rejected. The scheduler must place expert operations and staging conversions on the selected backend; otherwise the call fails instead of presenting a CPU fallback as GPU acceleration.
 
-The current staging transfers are synchronous and use pageable host storage. Pinned bounce buffers, overlap, graph reuse and automatic microbatch selection are future optimizations, not implemented capabilities.
+## Microbatch activation pipeline
+
+On an asynchronous GPU backend with events and pinned host buffers, `pipeline = true` (the default) uses two input slots and two output slots. The complete layer activations stay in pageable system memory; only the bounded bounce buffers are pinned. Failure to obtain real pinned storage is an error, not a silent pageable substitute. `--no-pipeline` selects the synchronous reference in the example.
+
+Each slot owns persistent device storage outside the scheduler's graph buffers. A graph reads its input slot and writes its output slot directly, so resetting the graph cannot invalidate an in-flight activation copy.
+
+- Upload and download use separate backend streams from compute.
+- Before compute consumes an input slot, its stream waits for that slot's upload event.
+- Once a microbatch has been submitted, the host queues the next microbatch's input upload before waiting for current compute.
+- After compute completes, the output slot is copied asynchronously to pinned host memory. It can remain in flight during the next microbatch's compute.
+- A slot is not reused until its previous transfer completes. At layer boundaries, all copies are drained before swapping host activation buffers.
+
+KDA computation remains sequential in token order. This pipelines transfers, not independent execution of causally dependent microbatches. Compute is still synchronized before graph reset; graph reuse and concurrent graph execution are not implemented.
+
+For hidden size 4096, four streams, BF16 staging and microbatch 256, the device slots occupy 32 MiB and the pinned slots another 32 MiB, before backend padding. Both are charged to `max_transfer_bytes`; pinned bytes also count against `max_host_bytes`. Scheduler compute buffers, experts and persistent state are additional allocations.
+
+Statistics report active pipelining, allocated transfer bytes, next-input prefetches and asynchronous output batches. Tests require these counts to cover every eligible microbatch, not merely numerical parity. They also cover insufficient transfer budgets and retry after failure. These counters establish that the asynchronous path executed, not a hardware-overlap percentage or an end-to-end speedup.
 
 ## Reference
 
