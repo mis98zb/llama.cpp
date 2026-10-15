@@ -29,6 +29,18 @@ public:
         std::vector<uint32_t> sdst;
     };
 
+    struct metadata {
+        const llama_kv_cache * owner;
+        llama_kv_cells_vec cells;
+        std::vector<uint32_t> heads;
+        std::vector<uint32_t> streams;
+        stream_copy_info copies;
+    };
+
+    metadata snapshot_metadata() const;
+    void restore_metadata(const metadata & state);
+    bool has_pending_updates() const;
+
     // for each ubatch, create a slot_info that contains information about where the ubatch should be inserted in the
     //   KV cells. for example, cell indices for each token, such that: token[i] -> goes to cells[idxs[i]]
     struct slot_info {

@@ -142,6 +142,10 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
     return std::make_unique<llama_memory_hybrid_idx_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid_idx::init_measure(uint32_t active_tokens, uint32_t new_pools) {
+    return std::make_unique<llama_memory_hybrid_idx_context>(this, active_tokens, new_pools);
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
@@ -349,6 +353,71 @@ struct llama_memory_hybrid_idx::kpool_layout {
     uint32_t n_pool_real = 0;
 };
 
+struct llama_memory_hybrid_idx::replay_state {
+    const llama_memory_hybrid_idx * owner;
+    llama_kv_cache::metadata attention;
+    llama_kv_cache::metadata indexer;
+    llama_memory_recurrent::metadata recurrent;
+    kpool_layout pools;
+    stale_pos_t stale;
+};
+
+std::shared_ptr<const llama_memory_hybrid_idx::replay_state> llama_memory_hybrid_idx::snapshot_metadata() {
+    if (!mem_idx) {
+        throw std::runtime_error("hybrid metadata replay requires an indexer cache");
+    }
+    return std::make_shared<replay_state>(replay_state{
+        this, get_mem_attn()->snapshot_metadata(), mem_idx->snapshot_metadata(),
+        get_mem_recr()->snapshot_metadata(), kpool_layout_update(), mem_idx_stale});
+}
+
+void llama_memory_hybrid_idx::restore_metadata(const replay_state & state) {
+    if (state.owner != this || !mem_idx) {
+        throw std::runtime_error("hybrid metadata snapshot does not match its memory");
+    }
+    get_mem_attn()->restore_metadata(state.attention);
+    mem_idx->restore_metadata(state.indexer);
+    get_mem_recr()->restore_metadata(state.recurrent);
+    kpool_lay = std::make_unique<kpool_layout>(state.pools);
+    mem_idx_stale = state.stale;
+}
+
+bool llama_memory_hybrid_idx::has_complete_prefix(llama_seq_id seq_id) const {
+    if (!mem_idx || get_mem_attn()->has_pending_updates() || mem_idx->has_pending_updates()) {
+        return false;
+    }
+    const llama_pos end = get_mem_attn()->seq_pos_max(seq_id);
+    if (end != mem_idx->seq_pos_max(seq_id) || end != get_mem_recr()->seq_pos_max(seq_id)) {
+        return false;
+    }
+    const auto & attention_cells = get_mem_attn()->get_cells(seq_id);
+    const auto & indexer_cells = mem_idx->get_cells(seq_id);
+    const auto & attention = attention_cells.seq_pos_get(seq_id);
+    const auto & indexer = indexer_cells.seq_pos_get(seq_id);
+    if (attention != indexer || attention.size() != size_t(int64_t(end) + 1) ||
+        attention_cells.get_used() != attention.size() || indexer_cells.get_used() != indexer.size()) {
+        return false;
+    }
+    llama_pos expected = 0;
+    for (const auto & cell : attention) {
+        if (cell.first != expected++ || attention_cells.seq_count(cell.second) != 1 ||
+            indexer_cells.seq_count(cell.second) != 1) {
+            return false;
+        }
+    }
+    const auto * recurrent = get_mem_recr();
+    for (size_t i = 0; i < recurrent->cells.size(); ++i) {
+        if (!recurrent->cells[i].is_empty() &&
+            (recurrent->cells[i].seq_id.size() != 1 || !recurrent->cells[i].has_seq_id(seq_id))) {
+            return false;
+        }
+        if (recurrent->cells[i].has_seq_id(seq_id) && recurrent->cells[i].src != (int32_t) i) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Which pools of the layout the current ubatch must re-pool, in the layout's pool order.
 struct llama_memory_hybrid_idx_context::kpool_state {
     std::vector<uint32_t> is_new;
@@ -471,7 +540,8 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
     llama_memory_hybrid_context(status) {}
 
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
+        llama_memory_hybrid_idx * mem, uint32_t active_tokens, uint32_t new_pools) :
     llama_memory_hybrid_context(mem),
     mem(mem),
     // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
@@ -484,11 +554,14 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         mem->kpool_layout_update();
         auto st = kpool_build_sizes();
         const auto * idx = mem->get_mem_idx();
-        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
+        const uint64_t n_pool_max = active_tokens ? active_tokens / mem->get_kpool() :
+            uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
-        st.n_new   = st.n_pool_real;
-        st.n_new_g = std::max(st.n_new, 1u);
+        st.n_new   = std::min(st.n_pool_real, new_pools);
+        const uint32_t cache_pools = uint32_t(std::min<uint64_t>(UINT32_MAX,
+            uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max()));
+        st.n_new_g = std::max({st.n_new, 1u, std::min({new_pools, kpool_pad(st.n_pool_real) - 1, cache_pools})});
         kpool_st = std::make_unique<kpool_state>(std::move(st));
         i_kpool  = 0;
     }

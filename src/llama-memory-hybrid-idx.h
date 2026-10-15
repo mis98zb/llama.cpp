@@ -92,6 +92,12 @@ public:
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
 
+    struct replay_state;
+    std::shared_ptr<const replay_state> snapshot_metadata();
+    void restore_metadata(const replay_state & state);
+    bool has_complete_prefix(llama_seq_id seq_id) const;
+    llama_memory_context_ptr init_measure(uint32_t active_tokens, uint32_t new_pools);
+
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
     // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
     using stale_pos_t = std::array<llama_pos, LLAMA_MAX_SEQ>;
@@ -154,7 +160,8 @@ public:
     explicit llama_memory_hybrid_idx_context(llama_memory_status status);
 
     // used to create a full-cache context
-    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
+    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem,
+                                             uint32_t active_tokens = 0, uint32_t new_pools = UINT32_MAX);
 
     // used to create an update context
     llama_memory_hybrid_idx_context(

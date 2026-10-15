@@ -675,17 +675,22 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * cur;
     const bool layered = params.prefill_layer >= 0;
     const int first = layered ? params.prefill_layer : 0;
-    const int last  = layered ? first + 1 : n_layer;
+    const int last  = layered ? first + params.prefill_layers : n_layer;
     GGML_ASSERT(first >= 0 && last <= n_layer);
 
     // recurrent state + K-only MLA cache through the generic hybrid input, plus the indexer cache
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
 
-    auto * inp_hyb   = build_inp_mem_hybrid_k(!layered || !hparams.is_recr(first),
-                                            !layered || hparams.is_recr(first));
+    bool has_attn = !layered;
+    bool has_recr = !layered;
+    for (int il = first; il < last; ++il) {
+        has_attn |= !hparams.is_recr(il);
+        has_recr |= hparams.is_recr(il);
+    }
+    auto * inp_hyb   = build_inp_mem_hybrid_k(has_attn, has_recr);
     auto * inp_rs    = inp_hyb->get_recr();
     auto * inp_attn  = inp_hyb->get_attn();
-    auto * inp_kpool = !layered || !hparams.is_recr(first) ? build_inp_kpool(mctx_hyb) : nullptr;
+    auto * inp_kpool = has_attn ? build_inp_kpool(mctx_hyb) : nullptr;
 
     ggml_tensor * inp_out_ids = !layered || (last == n_layer && n_outputs > 0) ? build_inp_out_ids() : nullptr;
 
@@ -723,7 +728,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * prev_sel = nullptr;
 
     for (int il = first; il < last; ++il) {
-        const auto & layer = params.prefill_weights ? *params.prefill_weights : model.layers[il];
+        const auto & layer = params.prefill_weights ? params.prefill_weights[il - first] : model.layers[il];
 
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
@@ -788,6 +793,9 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
+        if (layered && il + 1 < last && params.prefill_type == GGML_TYPE_BF16) {
+            inpL = ggml_cast(ctx0, ggml_cast(ctx0, inpL, GGML_TYPE_BF16), GGML_TYPE_F32);
+        }
     }
 
     if (layered) {

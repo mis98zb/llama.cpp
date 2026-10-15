@@ -145,6 +145,22 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
+llama_memory_recurrent::metadata llama_memory_recurrent::snapshot_metadata() const {
+    return {this, head, used, n, rs_z, rs_idx, cells};
+}
+
+void llama_memory_recurrent::restore_metadata(const metadata & state) {
+    if (state.owner != this || state.cells.size() != cells.size() || state.rs_idx.size() != rs_idx.size()) {
+        throw std::runtime_error("recurrent metadata snapshot does not match its cache");
+    }
+    head = state.head;
+    used = state.used;
+    n = state.n;
+    rs_z = state.rs_z;
+    rs_idx = state.rs_idx;
+    cells = state.cells;
+}
+
 void llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;

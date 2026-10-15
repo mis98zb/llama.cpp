@@ -11,6 +11,8 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-prefill-plan.h"
+#include "../src/llama-memory-hybrid-idx.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -106,6 +108,8 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --layered-prefill        Test experimental GLM5-Next layer-major prefill\n");
+    LOG("  --layered-planner        Test grouped execution and joint planning\n");
+    LOG("  --layered-prefix         Test resident hybrid prefix reuse\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -519,7 +523,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
-        uint32_t ubatch_size = 64, ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_data = nullptr) {
+        uint32_t ubatch_size = 64, ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_data = nullptr,
+        ggml_type cache_k = GGML_TYPE_F16) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -535,6 +540,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads_batch = 4;
     ctx_params.cb_eval = cb_eval;
     ctx_params.cb_eval_user_data = cb_data;
+    ctx_params.type_k = cache_k;
+    ctx_params.type_v = cache_k;
     if (!encode) {
         ctx_params.n_ubatch = ubatch_size;
     }
@@ -607,8 +614,34 @@ static bool round_prefill_boundary(ggml_tensor * tensor, bool ask, void * data) 
     return true;
 }
 
+static gguf_context_ptr layered_metadata(bool quantized) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    llama_model_saver ms(LLM_ARCH_GLM5_NEXT, metadata.get());
+    ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, std::vector<uint32_t>{0, 1, 0, 1});
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(32));
+    if (quantized) {
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH, uint32_t(256));
+        ms.add_kv(LLM_KV_FEATURES_LENGTH, uint32_t(256));
+        ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH, uint32_t(256));
+        ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, uint32_t(256));
+        for (uint32_t il = 1; il < 4; ++il) {
+            for (const char * part : {"gate", "up", "down"}) {
+                ggml_tensor tensor = {};
+                tensor.type = GGML_TYPE_Q4_K;
+                tensor.ne[0] = tensor.ne[1] = 256;
+                tensor.ne[2] = 2;
+                tensor.ne[3] = 1;
+                ggml_format_name(&tensor, "blk.%u.ffn_%s_exps.weight", il, part);
+                gguf_add_tensor(metadata.get(), &tensor);
+            }
+        }
+    }
+    return metadata;
+}
+
 static int test_layered_prefill(size_t seed, float stdev, const char * target_backend,
-                                bool quantized, bool pipeline, int prefetch_mode = 0) {
+                                bool quantized, bool pipeline, int prefetch_mode = 0, uint32_t group_layers = 1) {
     const auto tokens = get_tokens(137, 128, seed);
     uint64_t expected_copies = 0;
     uint32_t n_cases = 0;
@@ -621,28 +654,7 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
     };
     for (uint32_t ubatch : {7u, 32u, 64u}) {
         for (ggml_type staging : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
-            auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
-            llama_model_saver ms(LLM_ARCH_GLM5_NEXT, metadata.get());
-            ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(4));
-            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, std::vector<uint32_t>{0, 1, 0, 1});
-            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(32));
-            if (quantized) {
-                ms.add_kv(LLM_KV_EMBEDDING_LENGTH, uint32_t(256));
-                ms.add_kv(LLM_KV_FEATURES_LENGTH, uint32_t(256));
-                ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH, uint32_t(256));
-                ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, uint32_t(256));
-                for (uint32_t il = 1; il < 4; ++il) {
-                    for (const char * part : {"gate", "up", "down"}) {
-                        ggml_tensor tensor = {};
-                        tensor.type = GGML_TYPE_Q4_K;
-                        tensor.ne[0] = tensor.ne[1] = 256;
-                        tensor.ne[2] = 2;
-                        tensor.ne[3] = 1;
-                        ggml_format_name(&tensor, "blk.%u.ffn_%s_exps.weight", il, part);
-                        gguf_add_tensor(metadata.get(), &tensor);
-                    }
-                }
-            }
+            auto metadata = layered_metadata(quantized);
             bool rounding = staging == GGML_TYPE_BF16;
             auto reference = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
                                                LLAMA_SPLIT_MODE_LAYER, false, devices.empty() ? overrides : nullptr,
@@ -657,6 +669,7 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             pp.require_gpu = false;
             pp.staging_type = staging;
             pp.pipeline = pipeline;
+            pp.group_layers = group_layers;
             pp.weight_prefetch = prefetch_mode != 0;
             if (prefetch_mode) {
                 pp.max_compute_bytes = size_t(64) << 20;
@@ -682,7 +695,8 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             }
             if (stats.expert_layer_loads != 3 || stats.expert_copy_bytes == 0 ||
                 (expected_copies && expected_copies != stats.expert_copy_bytes) ||
-                stats.microbatches != 4 * ((tokens.size() + ubatch - 1) / ubatch)) {
+                stats.groups.size() != (4 + group_layers - 1) / group_layers ||
+                stats.microbatches != stats.groups.size() * ((tokens.size() + ubatch - 1) / ubatch)) {
                 throw std::runtime_error("experts were not loaded once per layer");
             }
             expected_copies = stats.expert_copy_bytes;
@@ -692,7 +706,7 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             }
             if (stats.pipeline_active &&
                 (stats.transfer_buffer_bytes == 0 || stats.async_output_batches != stats.microbatches ||
-                 stats.input_prefetches != 3 * ((tokens.size() + ubatch - 1) / ubatch - 1))) {
+                 stats.input_prefetches != (stats.groups.size() - 1) * ((tokens.size() + ubatch - 1) / ubatch - 1))) {
                 throw std::runtime_error("layered prefill did not pipeline all activation transfers");
             }
             if (gpu && prefetch_mode == 1 &&
@@ -788,8 +802,8 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
                 throw std::runtime_error("single-token prefill after failure differs from ordinary decode");
             }
-            LOG("layered prefill: ubatch=%u staging=%s quantized=%d pipeline=%d prefetch=%u skip=%u, logits/state/decode/budgets OK, expert bytes=%" PRIu64 "\n",
-                ubatch, ggml_type_name(staging), quantized, stats.pipeline_active,
+            LOG("layered prefill: ubatch=%u group=%u staging=%s quantized=%d pipeline=%d prefetch=%u skip=%u, logits/state/decode/budgets OK, expert bytes=%" PRIu64 "\n",
+                ubatch, group_layers, ggml_type_name(staging), quantized, stats.pipeline_active,
                 stats.weight_prefetches, stats.weight_prefetch_skips, stats.expert_copy_bytes);
             ++n_cases;
         }
@@ -798,6 +812,402 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
         throw std::runtime_error("not all layered prefill test cases executed");
     }
     return 0;
+}
+
+static void test_prefill_cost_model() {
+    llama_prefill_cost cost;
+    cost.measured[0] = true;
+    cost.compute_ms[0] = 2;
+    cost.read_bytes_per_ms = cost.write_bytes_per_ms = 1000000;
+    cost.weight_bytes_per_ms = 1000;
+    const std::vector<uint32_t> families = {0, 0};
+    const std::vector<size_t> weights = {200000, 200000};
+    const std::vector<llama_layered_prefill_group> prefetch = {{0, 1, 1}, {1, 1, 0}};
+    const std::vector<llama_layered_prefill_group> grouped = {{0, 2, 0}};
+    const auto estimate = [&](const std::vector<llama_layered_prefill_group> & groups, size_t row) {
+        return llama_prefill_estimate(cost, groups, families, weights, 1024, 64, row, true);
+    };
+    if (!(estimate(prefetch, 1) < estimate(grouped, 1))) {
+        throw std::runtime_error("cost model failed to prefer prefetch for weight-bound input");
+    }
+    cost.weight_bytes_per_ms = 1000000;
+    if (!(estimate(grouped, 65536) < estimate(prefetch, 65536))) {
+        throw std::runtime_error("cost model failed to prefer grouping for activation-bound input");
+    }
+    const std::vector<llama_layered_prefill_group> plain = {{0, 1, 0}, {1, 1, 0}};
+    const double serial = llama_prefill_estimate(cost, plain, families, weights, 1024, 64, 65536, false);
+    const double piped = estimate(plain, 65536);
+    if (!(piped < serial)) {
+        throw std::runtime_error("cost model did not account for activation overlap");
+    }
+    bool rejected = false;
+    try {
+        llama_prefill_estimate(cost, {{0, 1, 2}, {1, 1, 0}}, families, weights, 1024, 64, 1, true);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    if (!rejected) {
+        throw std::runtime_error("cost model accepted an out-of-range prefetch");
+    }
+}
+
+static std::vector<float> native_suffix(llama_model * model, llama_context * ctx,
+                                        const std::vector<llama_token> & tokens, llama_pos first);
+static std::vector<uint8_t> prefix_state(llama_context * ctx);
+
+static int test_joint_prefill(size_t seed, float stdev, const char * target_backend) {
+    LOG("joint planner: testing cost model\n");
+    test_prefill_cost_model();
+    LOG("joint planner: testing executable plans\n");
+    const auto tokens = get_tokens(97, 128, seed);
+    std::vector<ggml_backend_dev_t> devices;
+    if (target_backend) {
+        devices.push_back(ggml_backend_dev_by_name(target_backend));
+    }
+    const bool gpu = !devices.empty() && ggml_backend_dev_type(devices[0]) == GGML_BACKEND_DEVICE_TYPE_GPU;
+    const llama_model_tensor_buft_override overrides[] = {
+        { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() }, { nullptr, nullptr },
+    };
+    for (ggml_type staging : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        auto metadata = layered_metadata(true);
+        auto candidate = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
+                                           LLAMA_SPLIT_MODE_LAYER, false, overrides, 0, 32);
+        auto reference_model = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
+                                                 LLAMA_SPLIT_MODE_LAYER, false, gpu ? nullptr : overrides, 0, 32);
+        reference_model.second.reset();
+        auto * ctx = candidate.second.get();
+        llama_layered_prefill_params params;
+        params.require_gpu = false;
+        params.n_ubatch = 32;
+        params.staging_type = staging;
+        params.max_compute_bytes = size_t(64) << 20;
+        params.max_prefetch_bytes = size_t(64) << 20;
+        params.prefetch_headroom_bytes = size_t(64) << 20;
+        params.weight_prefetch = false;
+        llama_layered_prefill_stats single;
+        if (llama_prefill_layered(ctx, tokens.data(), tokens.size(), params, &single)) {
+            throw std::runtime_error("failed to obtain reference expert allocation size");
+        }
+        const size_t one_layer = single.groups[1].expert_bytes;
+        const auto compare = [&](const llama_layered_prefill_stats & stats) {
+            if (!stats.selected_ubatch || stats.selected_ubatch > params.n_ubatch ||
+                !stats.planner_candidates || !std::isfinite(stats.estimated_ms) || stats.estimated_ms <= 0) {
+                throw std::runtime_error("joint planner did not return a measured executable plan");
+            }
+            uint32_t next_layer = 0;
+            for (size_t g = 0; g < stats.groups.size(); ++g) {
+                const auto & group = stats.groups[g];
+                if (group.first_layer != next_layer || group.n_layers == 0 ||
+                    group.n_layers > params.max_group_layers || group.compute_bytes > params.max_compute_bytes ||
+                    (params.max_group_expert_bytes && group.expert_bytes > params.max_group_expert_bytes) ||
+                    group.n_prefetch_layers > (g + 1 < stats.groups.size() ? stats.groups[g + 1].n_layers : 0)) {
+                    throw std::runtime_error("joint planner returned an invalid group or exceeded a budget");
+                }
+                next_layer += group.n_layers;
+            }
+            const size_t row = ggml_row_size(staging, 256*4);
+            if (next_layer != 4 ||
+                stats.microbatches != stats.groups.size() * ((tokens.size() + stats.selected_ubatch - 1) / stats.selected_ubatch) ||
+                stats.activation_read_bytes != (stats.groups.size() - 1) * row * tokens.size() ||
+                stats.activation_write_bytes != stats.groups.size() * row * tokens.size() ||
+                llama_memory_seq_pos_max(llama_get_memory(ctx), 0) != (llama_pos) tokens.size() - 1) {
+                throw std::runtime_error("selected plan was not executed or calibration leaked into the prefix");
+            }
+            auto cp = llama_context_default_params();
+            cp.n_ctx = 256;
+            cp.n_ubatch = stats.selected_ubatch;
+            cp.n_threads = cp.n_threads_batch = 4;
+            bool rounding = staging == GGML_TYPE_BF16;
+            cp.cb_eval = rounding ? round_prefill_boundary : nullptr;
+            cp.cb_eval_user_data = &rounding;
+            llama_context_ptr ref(llama_init_from_model(reference_model.first.get(), cp));
+            if (!ref) {
+                throw std::runtime_error("failed to create selected-batch reference");
+            }
+            const auto all = get_logits(reference_model.first.get(), ref.get(), tokens);
+            rounding = false;
+            const size_t nv = 128;
+            std::vector<float> expected(all.end() - nv, all.end());
+            std::vector<float> actual(llama_get_logits(ctx), llama_get_logits(ctx) + nv);
+            const double tolerance = !gpu && staging == GGML_TYPE_F32 ? 1e-10 : 1e-5;
+            if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
+                throw std::runtime_error("joint planner logits mismatch at its selected batch size");
+            }
+            std::vector<uint8_t> prefix(llama_state_seq_get_size(ref.get(), 0));
+            llama_state_seq_get_data(ref.get(), prefix.data(), prefix.size(), 0);
+            if (!gpu && staging == GGML_TYPE_F32) {
+                std::vector<uint8_t> actual_state(llama_state_seq_get_size(ctx, 0));
+                llama_state_seq_get_data(ctx, actual_state.data(), actual_state.size(), 0);
+                if (prefix != actual_state) {
+                    throw std::runtime_error("joint planner final state differs from normal execution");
+                }
+            }
+            cp.cb_eval = nullptr;
+            llama_context_ptr replay(llama_init_from_model(candidate.first.get(), cp));
+            if (!replay || llama_state_seq_set_data(replay.get(), prefix.data(), prefix.size(), 0) != prefix.size()) {
+                throw std::runtime_error("failed to restore selected-plan reference state");
+            }
+            common_batch a(replay.get()), b(ctx);
+            a.add(17, tokens.size(), 0, true);
+            b.add(17, tokens.size(), 0, true);
+            if (llama_process(replay.get(), LLAMA_PROCESS_TYPE_DECODE, a.get()) ||
+                llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get())) {
+                throw std::runtime_error("decode after joint planning failed");
+            }
+            expected.assign(llama_get_logits(replay.get()), llama_get_logits(replay.get()) + nv);
+            actual.assign(llama_get_logits(ctx), llama_get_logits(ctx) + nv);
+            if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
+                throw std::runtime_error("decode after joint planning logits mismatch");
+            }
+        };
+        params.auto_plan = true;
+        for (size_t limit : {size_t(0), one_layer}) {
+            params.max_group_expert_bytes = limit;
+            params.weight_prefetch = true;
+            llama_memory_clear(llama_get_memory(ctx), true);
+            params.max_calibration_ms = 2000;
+            llama_layered_prefill_stats stats;
+            if (llama_prefill_layered(ctx, tokens.data(), tokens.size(), params, &stats)) {
+                throw std::runtime_error("joint prefill planning failed");
+            }
+            compare(stats);
+            const auto retained = prefix_state(ctx);
+            const uint32_t retained_tokens = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+            const auto appended = get_tokens(32, 128, seed + 5);
+            params.reuse_prefix = true;
+            params.max_calibration_ms = 0;
+            llama_layered_prefill_stats reused;
+            if (llama_prefill_layered(ctx, appended.data(), appended.size(), params, &reused) ||
+                !reused.profile_reused || reused.capacity_only || reused.calibration_probes ||
+                reused.reused_prefix_tokens != retained_tokens || reused.evaluated_tokens != appended.size()) {
+                throw std::runtime_error("live prefix did not reuse timing calibration without destructive probing");
+            }
+            auto oracle_params = llama_context_default_params();
+            oracle_params.n_ctx = 256;
+            oracle_params.n_ubatch = reused.selected_ubatch;
+            oracle_params.n_threads = oracle_params.n_threads_batch = 4;
+            bool suffix_rounding = staging == GGML_TYPE_BF16;
+            oracle_params.cb_eval = suffix_rounding ? round_prefill_boundary : nullptr;
+            oracle_params.cb_eval_user_data = &suffix_rounding;
+            llama_context_ptr oracle(llama_init_from_model(reference_model.first.get(), oracle_params));
+            if (!oracle || llama_state_seq_set_data(oracle.get(), retained.data(), retained.size(), 0) != retained.size()) {
+                throw std::runtime_error("failed to restore the timed-prefix oracle");
+            }
+            const auto suffix_logits = native_suffix(reference_model.first.get(), oracle.get(), appended, retained_tokens);
+            std::vector<float> reused_logits(llama_get_logits(ctx), llama_get_logits(ctx) + 128);
+            if (!std::isfinite(nmse(suffix_logits, reused_logits)) ||
+                nmse(suffix_logits, reused_logits) > (!gpu && staging == GGML_TYPE_F32 ? 1e-10 : 1e-5)) {
+                throw std::runtime_error("timed resident-prefix logits mismatch");
+            }
+            params.reuse_prefix = false;
+            llama_memory_clear(llama_get_memory(ctx), true);
+            params.max_calibration_ms = 0;
+            llama_layered_prefill_stats cached;
+            if (llama_prefill_layered(ctx, tokens.data(), tokens.size(), params, &cached) ||
+                !cached.profile_reused || cached.calibration_probes != 0) {
+                throw std::runtime_error("joint planner did not reuse its context-local calibration");
+            }
+            compare(cached);
+            LOG("joint planner: staging=%s weight limit=%zu batch=%u groups=%zu alternatives=%u, state/decode/cache OK\n",
+                ggml_type_name(staging), limit, stats.selected_ubatch, stats.groups.size(), stats.planner_candidates);
+        }
+        llama_memory_clear(llama_get_memory(ctx), true);
+        params.max_group_expert_bytes = 1;
+        if (llama_prefill_layered(ctx, tokens.data(), tokens.size(), params) != -2 ||
+            llama_memory_seq_pos_max(llama_get_memory(ctx), 0) >= 0) {
+            throw std::runtime_error("infeasible joint plan retained a partial prefix");
+        }
+    }
+    return 0;
+}
+
+static std::vector<float> native_suffix(llama_model * model, llama_context * ctx,
+                                        const std::vector<llama_token> & tokens, llama_pos first) {
+    common_batch batch(ctx);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        batch.add(tokens[i], first + i, 0, i + 1 == tokens.size());
+    }
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+        throw std::runtime_error("native suffix decode failed");
+    }
+    const size_t nv = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto * logits = llama_get_logits_ith(ctx, -1);
+    return {logits, logits + nv};
+}
+
+static std::vector<uint8_t> prefix_state(llama_context * ctx) {
+    std::vector<uint8_t> state(llama_state_seq_get_size(ctx, 0));
+    if (llama_state_seq_get_data(ctx, state.data(), state.size(), 0) != state.size()) {
+        throw std::runtime_error("failed to save test prefix state");
+    }
+    return state;
+}
+
+static int test_prefix_prefill(size_t seed, float stdev, const char * target_backend, ggml_type cache_k) {
+    std::vector<ggml_backend_dev_t> devices;
+    if (target_backend) {
+        devices.push_back(ggml_backend_dev_by_name(target_backend));
+    }
+    const bool gpu = !devices.empty() && ggml_backend_dev_type(devices[0]) == GGML_BACKEND_DEVICE_TYPE_GPU;
+    const llama_model_tensor_buft_override overrides[] = {
+        { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() }, { nullptr, nullptr },
+    };
+    uint32_t cases = 0;
+    for (ggml_type staging : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        for (uint32_t prefix_tokens : {3u, 33u}) {
+            for (uint32_t group : {1u, 2u, 3u, 0u}) {
+                auto metadata = layered_metadata(true);
+                auto candidate = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
+                                                    LLAMA_SPLIT_MODE_LAYER, false, overrides, 0, 7, nullptr, nullptr, cache_k);
+                auto reference = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
+                                                    LLAMA_SPLIT_MODE_LAYER, false, gpu ? nullptr : overrides, 0, 7, nullptr, nullptr, cache_k);
+                const auto prefix = get_tokens(prefix_tokens, 128, seed);
+                const auto suffix = get_tokens(19, 128, seed + 1);
+                native_suffix(candidate.first.get(), candidate.second.get(), prefix, 0);
+                const auto saved = prefix_state(candidate.second.get());
+                auto cp = llama_context_default_params();
+                cp.n_ctx = 256;
+                cp.n_ubatch = 7;
+                cp.n_threads = cp.n_threads_batch = 4;
+                cp.type_k = cache_k;
+                cp.type_v = cache_k;
+                bool rounding = staging == GGML_TYPE_BF16;
+                cp.cb_eval = rounding ? round_prefill_boundary : nullptr;
+                cp.cb_eval_user_data = &rounding;
+                reference.second.reset(llama_init_from_model(reference.first.get(), cp));
+                if (!reference.second ||
+                    llama_state_seq_set_data(reference.second.get(), saved.data(), saved.size(), 0) != saved.size()) {
+                    throw std::runtime_error("failed to restore prefix with the reference precision");
+                }
+                const auto expected = native_suffix(reference.first.get(), reference.second.get(), suffix, prefix_tokens);
+                rounding = false;
+                llama_layered_prefill_params params;
+                params.n_ubatch = 7;
+                params.require_gpu = false;
+                params.reuse_prefix = true;
+                params.pipeline = group != 3;
+                params.group_layers = group ? group : 1;
+                params.auto_plan = group == 0;
+                params.max_group_expert_bytes = group == 0 ? 300*1024 : 0;
+                params.max_calibration_ms = 0;
+                params.max_compute_bytes = size_t(64) << 20;
+                params.prefetch_headroom_bytes = size_t(64) << 20;
+                params.max_prefetch_layers = prefix_tokens == 3 ? 1 : 2;
+                params.weight_prefetch = group == 2;
+                params.staging_type = staging;
+                auto * ctx = candidate.second.get();
+                if (group == 0) {
+                    if (llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0) != saved.size()) {
+                        throw std::runtime_error("failed to exercise restored resident prefix");
+                    }
+                }
+                const auto before = prefix_state(ctx);
+                params.max_host_bytes = 1;
+                if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params) != -2 || prefix_state(ctx) != before) {
+                    throw std::runtime_error("admission failure changed the resident prefix");
+                }
+                params.max_host_bytes = size_t(16) << 30;
+                llama_layered_prefill_stats stats;
+                if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params, &stats)) {
+                    throw std::runtime_error("resident prefix suffix prefill failed");
+                }
+                if (stats.reused_prefix_tokens != prefix_tokens || stats.evaluated_tokens != suffix.size() ||
+                    stats.calibration_probes != 0 ||
+                    stats.expert_layer_loads != 3 || stats.expert_copy_bytes != 663552 ||
+                    stats.microbatches != stats.groups.size() * ((suffix.size() + stats.selected_ubatch - 1) / stats.selected_ubatch) ||
+                    llama_memory_seq_pos_max(llama_get_memory(ctx), 0) != (llama_pos) (prefix_tokens + suffix.size() - 1) ||
+                    (group == 0 && (!stats.capacity_only || stats.groups.size() < 3))) {
+                    throw std::runtime_error("prefix was recomputed or resident capacity planning was not honored");
+                }
+                if (gpu && group == 2 && stats.weight_prefetches != params.max_prefetch_layers) {
+                    throw std::runtime_error("resident prefix did not consume the partial/full next-group prefetch");
+                }
+                const double tolerance = !gpu && staging == GGML_TYPE_F32 ? 1e-10 : 1e-5;
+                std::vector<float> actual(llama_get_logits(ctx), llama_get_logits(ctx) + 128);
+                if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
+                    LOG_ERR("prefix mismatch: prefix=%u group=%u staging=%s NMSE=%g\n",
+                            prefix_tokens, group, ggml_type_name(staging), nmse(expected, actual));
+                    throw std::runtime_error("suffix logits differ from native complete-prefix execution");
+                }
+                const auto oracle_state = prefix_state(reference.second.get());
+                if (!gpu && staging == GGML_TYPE_F32 && prefix_state(ctx) != oracle_state) {
+                    throw std::runtime_error("complete prefix/suffix state differs from native execution");
+                }
+                cp.cb_eval = nullptr;
+                llama_context_ptr replay(llama_init_from_model(candidate.first.get(), cp));
+                if (!replay || llama_state_seq_set_data(replay.get(), oracle_state.data(), oracle_state.size(), 0) != oracle_state.size()) {
+                    throw std::runtime_error("failed to restore prefix/suffix decode oracle");
+                }
+                const auto next = native_suffix(candidate.first.get(), replay.get(), {17}, prefix_tokens + suffix.size());
+                const auto got = native_suffix(candidate.first.get(), ctx, {17}, prefix_tokens + suffix.size());
+                if (!std::isfinite(nmse(next, got)) || nmse(next, got) > tolerance) {
+                    throw std::runtime_error("decode after resident-prefix prefill differs");
+                }
+                if (llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0) != saved.size()) {
+                    throw std::runtime_error("failed to restore prefix for rejection tests");
+                }
+                if (group == 0) {
+                    const auto admission_state = prefix_state(ctx);
+                    params.max_group_expert_bytes = 1;
+                    llama_layered_prefill_stats rejected;
+                    if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params, &rejected) != -2 ||
+                        rejected.budget_shortfall_bytes == 0 || prefix_state(ctx) != admission_state) {
+                        throw std::runtime_error("resident budget failure did not report its gap or preserve the prefix");
+                    }
+                    params.max_group_expert_bytes = 300*1024;
+                    if (gpu) {
+                        params.prefetch_headroom_bytes = SIZE_MAX;
+                        if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params, &rejected) != -2 ||
+                            rejected.capacity_shortfall_bytes == 0 || rejected.resident_state_bytes == 0 ||
+                            rejected.resident_model_bytes == 0 || prefix_state(ctx) != admission_state) {
+                            throw std::runtime_error("resident VRAM failure did not report capacity or preserve state");
+                        }
+                        params.prefetch_headroom_bytes = size_t(64) << 20;
+                    }
+                }
+                if (group == 1 && prefix_tokens == 3 && staging == GGML_TYPE_F32) {
+                    auto failure = params;
+                    failure.max_expert_bytes = 1;
+                    llama_layered_prefill_stats failed;
+                    if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), failure, &failed) != -2 ||
+                        !failed.prefix_invalidated || llama_memory_seq_pos_max(llama_get_memory(ctx), 0) >= 0) {
+                        throw std::runtime_error("partial execution failure was not marked as invalidating the prefix");
+                    }
+                    if (llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0) != saved.size()) {
+                        throw std::runtime_error("failed to restore the invalidated test prefix");
+                    }
+                }
+                auto * hybrid = static_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+                hybrid->get_mem_recr()->seq_add(0, 0, -1, 1);
+                if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params) != -1) {
+                    throw std::runtime_error("incomplete recurrent prefix state was accepted");
+                }
+                if (group == 0) {
+                    if (llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0) != saved.size()) {
+                        throw std::runtime_error("failed to restore prefix for shared-cell rejection");
+                    }
+                    auto shared = hybrid->get_mem_attn()->snapshot_metadata();
+                    const auto cell = shared.cells[0].seq_pos_get(0).begin()->second;
+                    shared.cells[0].seq_add(cell, 1);
+                    hybrid->get_mem_attn()->restore_metadata(shared);
+                    if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params) != -1) {
+                        throw std::runtime_error("single-sequence prefix reuse accepted shared sequence cells");
+                    }
+                    hybrid->clear(true);
+                    auto orphan = hybrid->get_mem_recr()->snapshot_metadata();
+                    orphan.cells[0].seq_id.insert(1);
+                    hybrid->get_mem_recr()->restore_metadata(orphan);
+                    if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params) != -1) {
+                        throw std::runtime_error("empty attention cache concealed another sequence's recurrent state");
+                    }
+                }
+                LOG("resident prefix: staging=%s cache=%s prefix=%u group=%u pipeline=%d, suffix/state/decode/admission OK\n",
+                    ggml_type_name(staging), ggml_type_name(cache_k), prefix_tokens, group, stats.pipeline_active);
+                ++cases;
+            }
+        }
+    }
+    return cases == 16 ? 0 : 1;
 }
 
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
@@ -1368,6 +1778,9 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool layered_prefill = false;
+    bool layered_planner = false;
+    bool joint_only = false;
+    bool layered_prefix = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1377,6 +1790,13 @@ int main(int argc, char ** argv) {
             return 0;
         } else if (strcmp(argv[i], "--layered-prefill") == 0) {
             layered_prefill = true;
+        } else if (strcmp(argv[i], "--layered-planner") == 0) {
+            layered_planner = true;
+        } else if (strcmp(argv[i], "--joint-only") == 0) {
+            layered_planner = true;
+            joint_only = true;
+        } else if (strcmp(argv[i], "--layered-prefix") == 0) {
+            layered_prefix = true;
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -1450,6 +1870,24 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (layered_prefix) {
+            common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
+            const int status = test_prefix_prefill(seed, stdev, target_backend, GGML_TYPE_F16);
+            return status ? status : test_prefix_prefill(seed, stdev, target_backend, GGML_TYPE_Q8_0);
+        }
+        if (layered_planner) {
+            common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
+            if (!joint_only) {
+                for (uint32_t group : {2u, 3u, 4u}) {
+                    for (bool pipeline : {false, true}) {
+                        if (test_layered_prefill(seed, stdev, target_backend, true, pipeline, 0, group)) {
+                            return 1;
+                        }
+                    }
+                }
+            }
+            return test_joint_prefill(seed, stdev, target_backend);
+        }
         if (layered_prefill) {
             common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
             for (bool pipeline : {false, true}) {

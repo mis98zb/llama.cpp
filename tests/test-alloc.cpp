@@ -1099,6 +1099,26 @@ static void test_buft_get_alloc_size_n_does_not_allocate() {
     GGML_ASSERT(x[1]->data == nullptr);
 }
 
+static void test_allocate_after_size_only_reservation() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    ggml_gallocr_ptr allocator(ggml_gallocr_new(&backend.buffer_type));
+    for (size_t bytes : {size_t(16), size_t(128)}) {
+        auto [ctx, graph, owner] = make_context();
+        auto * input = make_input_with_size(ctx, bytes);
+        ggml_set_input(input);
+        auto * output = ggml_scale(ctx, input, 2.0f);
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        size_t sizes[1] = {};
+        ggml_gallocr_reserve_n_size(allocator.get(), graph, nullptr, nullptr, sizes);
+        GGML_ASSERT(sizes[0] > 0);
+        GGML_ASSERT(backend.context->buffers.empty());
+        GGML_ASSERT(ggml_gallocr_alloc_graph(allocator.get(), graph));
+        GGML_ASSERT(input->data != nullptr && output->data != nullptr);
+        GGML_ASSERT(backend.context->allocated_total() >= sizes[0]);
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1107,6 +1127,7 @@ static void run(const char * name, void (*f)()) {
 }
 
 int main() {
+    run("test_allocate_after_size_only_reservation", test_allocate_after_size_only_reservation);
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
     run("test_tensor_larger_than_max_size", test_tensor_larger_than_max_size);

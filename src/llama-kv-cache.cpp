@@ -388,6 +388,26 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+llama_kv_cache::metadata llama_kv_cache::snapshot_metadata() const {
+    return {this, v_cells, v_heads, seq_to_stream, sc_info};
+}
+
+void llama_kv_cache::restore_metadata(const metadata & state) {
+    if (state.owner != this || state.cells.size() != v_cells.size() ||
+        state.heads.size() != v_heads.size() || state.streams.size() != seq_to_stream.size()) {
+        throw std::runtime_error("KV metadata snapshot does not match its cache");
+    }
+    v_cells = state.cells;
+    v_heads = state.heads;
+    seq_to_stream = state.streams;
+    sc_info = state.copies;
+}
+
+bool llama_kv_cache::has_pending_updates() const {
+    return !sc_info.empty() || std::any_of(v_cells.begin(), v_cells.end(),
+        [](const llama_kv_cells & cells) { return cells.get_has_shift(); });
+}
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();

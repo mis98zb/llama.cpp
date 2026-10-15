@@ -16,6 +16,7 @@ set(LLAMA_CORE_SOURCES
     llama-chat.cpp
     llama-context.cpp
     llama-context-prefill.cpp
+    llama-prefill-plan.cpp
     llama-cparams.cpp
     llama-grammar.cpp
     llama-graph.cpp

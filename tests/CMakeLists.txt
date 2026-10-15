@@ -226,6 +226,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     #       this branch and run them on all platforms
     llama_build(test-llama-archs.cpp)
     llama_test(test-llama-archs NAME test-layered-prefill ARGS --layered-prefill --seed 42)
+    llama_test(test-llama-archs NAME test-layered-planner ARGS --layered-planner --seed 42)
+    llama_test(test-llama-archs NAME test-layered-prefix ARGS --layered-prefix --seed 42)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")

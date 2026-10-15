@@ -19,6 +19,8 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+struct llama_prefill_probe;
+struct llama_prefill_profile;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -267,6 +269,17 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    int prefill_layered_run(
+            const llama_token * tokens, int32_t n_tokens, const llama_layered_prefill_params & params,
+            llama_layered_prefill_stats * stats, ggml_backend_t device,
+            const std::vector<llama_layered_prefill_group> & groups, llama_prefill_probe * probe = nullptr);
+
+    int prefill_layered_plan(
+            const llama_token * tokens, int32_t n_tokens, const llama_layered_prefill_params & params,
+            llama_layered_prefill_stats * stats, ggml_backend_t device, bool capacity_only = false);
+
+    std::shared_ptr<llama_prefill_profile> prefill_profile;
+
     llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(

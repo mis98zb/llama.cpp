@@ -108,6 +108,17 @@ public:
 
     std::vector<mem_cell> cells;
 
+    struct metadata {
+        const llama_memory_recurrent * owner;
+        uint32_t head, used, n;
+        int32_t rs_z;
+        std::vector<uint32_t> rs_idx;
+        std::vector<mem_cell> cells;
+    };
+
+    metadata snapshot_metadata() const;
+    void restore_metadata(const metadata & state);
+
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;

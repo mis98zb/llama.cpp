@@ -13,9 +13,14 @@
 
 int main(int argc, char ** argv) {
     llama_layered_prefill_params pp;
+    uint32_t prefix_tokens = 0;
     std::vector<char *> common_args = {argv[0]};
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--staging-type") == 0) {
+        if ((std::strcmp(argv[i], "-p") == 0 || std::strcmp(argv[i], "--prompt") == 0 ||
+             std::strcmp(argv[i], "-f") == 0 || std::strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+            common_args.push_back(argv[i]);
+            common_args.push_back(argv[++i]);
+        } else if (std::strcmp(argv[i], "--staging-type") == 0) {
             if (++i == argc || (std::strcmp(argv[i], "bf16") != 0 && std::strcmp(argv[i], "f32") != 0)) {
                 std::fprintf(stderr, "--staging-type requires bf16 or f32\n");
                 return 1;
@@ -25,28 +30,51 @@ int main(int argc, char ** argv) {
             pp.pipeline = false;
         } else if (std::strcmp(argv[i], "--no-weight-prefetch") == 0) {
             pp.weight_prefetch = false;
+        } else if (std::strcmp(argv[i], "--auto-plan") == 0) {
+            pp.auto_plan = true;
         } else if (std::strcmp(argv[i], "--compute-budget-mib") == 0 ||
                    std::strcmp(argv[i], "--prefetch-budget-mib") == 0 ||
-                   std::strcmp(argv[i], "--prefetch-headroom-mib") == 0) {
+                   std::strcmp(argv[i], "--prefetch-headroom-mib") == 0 ||
+                   std::strcmp(argv[i], "--device-headroom-mib") == 0 ||
+                   std::strcmp(argv[i], "--group-budget-mib") == 0 ||
+                   std::strcmp(argv[i], "--group-layers") == 0 ||
+                   std::strcmp(argv[i], "--max-group-layers") == 0 ||
+                   std::strcmp(argv[i], "--max-prefetch-layers") == 0 ||
+                   std::strcmp(argv[i], "--prefix-tokens") == 0 ||
+                   std::strcmp(argv[i], "--calibration-ms") == 0) {
             const char * option = argv[i];
+            const bool mib = std::strstr(option, "-mib") != nullptr;
             if (++i == argc) {
-                std::fprintf(stderr, "%s requires a nonnegative MiB count\n", option);
+                std::fprintf(stderr, "%s requires a nonnegative count\n", option);
                 return 1;
             }
             try {
                 size_t end = 0;
                 const auto value = std::stoull(argv[i], &end);
                 if (argv[i][0] == '-' || end != std::strlen(argv[i]) ||
-                    value > (std::numeric_limits<size_t>::max() >> 20)) {
-                    throw std::invalid_argument("invalid MiB count");
+                    value > (mib ? std::numeric_limits<size_t>::max() >> 20 : UINT32_MAX)) {
+                    throw std::invalid_argument("invalid count");
                 }
-                const size_t bytes = size_t(value) << 20;
+                const size_t bytes = mib ? size_t(value) << 20 : size_t(value);
                 if (std::strcmp(option, "--compute-budget-mib") == 0) {
                     pp.max_compute_bytes = bytes;
                 } else if (std::strcmp(option, "--prefetch-budget-mib") == 0) {
                     pp.max_prefetch_bytes = bytes;
-                } else {
+                } else if (std::strcmp(option, "--prefetch-headroom-mib") == 0 ||
+                           std::strcmp(option, "--device-headroom-mib") == 0) {
                     pp.prefetch_headroom_bytes = bytes;
+                } else if (std::strcmp(option, "--group-budget-mib") == 0) {
+                    pp.max_group_expert_bytes = bytes;
+                } else if (std::strcmp(option, "--group-layers") == 0) {
+                    pp.group_layers = bytes;
+                } else if (std::strcmp(option, "--max-group-layers") == 0) {
+                    pp.max_group_layers = bytes;
+                } else if (std::strcmp(option, "--max-prefetch-layers") == 0) {
+                    pp.max_prefetch_layers = bytes;
+                } else if (std::strcmp(option, "--prefix-tokens") == 0) {
+                    prefix_tokens = bytes;
+                } else {
+                    pp.max_calibration_ms = bytes;
                 }
             } catch (const std::exception & e) {
                 std::fprintf(stderr, "%s: %s\n", option, e.what());
@@ -67,6 +95,10 @@ int main(int argc, char ** argv) {
                             [](int, char **) {
                                 LOG("Layered prefill: --staging-type bf16|f32, --no-pipeline, --no-weight-prefetch\n");
                                 LOG("Memory: --compute-budget-mib N, --prefetch-budget-mib N, --prefetch-headroom-mib N\n");
+                                LOG("Planner: --auto-plan, --group-layers N, --max-group-layers N, --max-prefetch-layers N\n");
+                                LOG("Planner limits: --group-budget-mib N, --calibration-ms N\n");
+                                LOG("Resident safety margin: --device-headroom-mib N (alias of --prefetch-headroom-mib)\n");
+                                LOG("Prefix demonstration: --prefix-tokens N (seed and reuse in this process)\n");
                             })) {
         return 1;
     }
@@ -107,16 +139,31 @@ int main(int argc, char ** argv) {
         }
         llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
         if (!ctx) {
-            throw std::runtime_error("failed to create context");
+            throw std::runtime_error("failed to create the resident context before planning; KV/state eviction is not implemented");
         }
         pp.n_ubatch = cp.n_ubatch;
         if (pp.staging_type == GGML_TYPE_BF16) {
             LOG_WRN("BF16 staging rounds residuals and may change sparse selection; use --staging-type f32 as a reference\n");
         }
         llama_layered_prefill_stats stats;
-        if (llama_prefill_layered(ctx.get(), tokens.data(), tokens.size(), pp, &stats) != 0) {
+        if (prefix_tokens >= tokens.size()) {
+            throw std::runtime_error("--prefix-tokens must be smaller than the tokenized prompt");
+        }
+        if (prefix_tokens) {
+            if (llama_prefill_layered(ctx.get(), tokens.data(), prefix_tokens, pp) != 0) {
+                throw std::runtime_error("failed to seed the resident prefix");
+            }
+            pp.reuse_prefix = true;
+        }
+        if (llama_prefill_layered(ctx.get(), tokens.data() + prefix_tokens, tokens.size() - prefix_tokens, pp, &stats) != 0) {
+            LOG_ERR("resident model=%zu state=%zu free snapshot=%zu extra requirement=%zu capacity gap=%zu policy gap=%zu prefix invalidated=%d\n",
+                    stats.resident_model_bytes, stats.resident_state_bytes, stats.device_free_bytes,
+                    stats.minimum_additional_bytes, stats.capacity_shortfall_bytes, stats.budget_shortfall_bytes,
+                    stats.prefix_invalidated);
             throw std::runtime_error("layered prefill failed; no fallback was used");
         }
+        LOG_INF("reused prefix=%u tokens, evaluated suffix=%u tokens, capacity-only plan=%d\n",
+                stats.reused_prefix_tokens, stats.evaluated_tokens, stats.capacity_only);
         LOG_INF("expert layer loads=%u, copied bytes=%" PRIu64 ", activation read/write=%" PRIu64 "/%" PRIu64
                 ", peak measured compute bytes=%zu\n", stats.expert_layer_loads, stats.expert_copy_bytes,
                 stats.activation_read_bytes, stats.activation_write_bytes, stats.peak_compute_bytes);
@@ -127,6 +174,14 @@ int main(int argc, char ** argv) {
                 stats.weight_prefetches, stats.weight_prefetch_skips, stats.weight_prefetch_allocation_attempts,
                 stats.prefetched_expert_bytes, stats.weight_prefetch_submit_bytes,
                 stats.peak_prefetch_bytes, stats.prefetch_pinned_bytes);
+        LOG_INF("selected batch=%u, groups=%zu, planner alternatives=%u, probes=%u, profile reused=%d, planning=%.2f ms\n",
+                stats.selected_ubatch, stats.groups.size(), stats.planner_candidates,
+                stats.calibration_probes, stats.profile_reused, stats.planning_ms);
+        for (const auto & group : stats.groups) {
+            LOG_INF("layers [%u,%u): prefetch=%u, experts=%zu, scheduler=%zu\n",
+                    group.first_layer, group.first_layer + group.n_layers, group.n_prefetch_layers,
+                    group.expert_bytes, group.compute_bytes);
+        }
         llama_perf_context_print(ctx.get());
         const auto * vocab = llama_model_get_vocab(model.get());
         const size_t nv = llama_vocab_n_tokens(vocab);

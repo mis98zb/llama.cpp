@@ -17,10 +17,20 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
-// Experimental: a complete initial text prompt, sequence 0, final-token logits only.
+// Experimental: single-sequence text prefill, final-token logits only.
 // Limits are bytes and exclude model and persistent context allocations.
 // The host, expert and compute limits must be nonzero.
 // max_compute_bytes bounds scheduler buffers, not backend-private kernel workspaces.
+struct llama_layered_prefill_group {
+    uint32_t first_layer = 0;
+    uint32_t n_layers = 1;
+    uint32_t n_prefetch_layers = 0;
+    size_t expert_bytes = 0;
+    size_t compute_bytes = 0;
+    size_t device_compute_bytes = 0;
+    double dispatch_ms = 0;
+};
+
 struct llama_layered_prefill_params {
     uint32_t n_ubatch = 256;
     ggml_type staging_type = GGML_TYPE_BF16;
@@ -32,7 +42,14 @@ struct llama_layered_prefill_params {
     size_t max_transfer_bytes = size_t(512) << 20; // activation device buffers and all pinned staging
     bool weight_prefetch = true;
     size_t max_prefetch_bytes = size_t(6) << 30; // additional next-layer device weights
-    size_t prefetch_headroom_bytes = size_t(512) << 20;
+    size_t prefetch_headroom_bytes = size_t(512) << 20; // resident-planning and prefetch safety margin
+    uint32_t group_layers = 1;
+    uint32_t max_prefetch_layers = 4;
+    size_t max_group_expert_bytes = 0; // zero: no extra group limit beyond device capacity
+    bool auto_plan = false;
+    uint32_t max_group_layers = 4;
+    uint32_t max_calibration_ms = 2000; // soft admission limit; one probe may finish after it
+    bool reuse_prefix = false; // tokens are only the suffix; reuse the context's complete sequence-0 state
 };
 
 struct llama_layered_prefill_stats {
@@ -53,10 +70,30 @@ struct llama_layered_prefill_stats {
     uint64_t weight_prefetch_submit_bytes = 0;
     size_t peak_prefetch_bytes = 0;
     size_t prefetch_pinned_bytes = 0;
+    uint32_t selected_ubatch = 0;
+    std::vector<llama_layered_prefill_group> groups;
+    uint32_t planner_candidates = 0;
+    uint32_t calibration_probes = 0;
+    bool profile_reused = false;
+    double calibration_ms = 0;
+    double planning_ms = 0;
+    double estimated_ms = 0;
+    uint32_t reused_prefix_tokens = 0;
+    uint32_t evaluated_tokens = 0;
+    bool capacity_only = false;
+    size_t resident_model_bytes = 0;
+    size_t resident_state_bytes = 0;
+    size_t device_free_bytes = 0;
+    size_t minimum_additional_bytes = 0;
+    size_t capacity_shortfall_bytes = 0;
+    bool shortfall_is_lower_bound = false;
+    size_t budget_shortfall_bytes = 0;
+    bool prefix_invalidated = false;
 };
 
 // Returns 0 on success, -1 on unsupported/invalid input, -2 on allocation/compute failure.
-// Once execution starts, failure clears the initially empty context; no partial prefix is retained.
+// With reuse_prefix, tokens contain only the consecutive suffix of the live sequence-0 state.
+// An execution failure invalidates the context; admission/planning failures preserve an existing prefix.
 LLAMA_API int32_t llama_prefill_layered(
         struct llama_context * ctx,
         const llama_token * tokens,
