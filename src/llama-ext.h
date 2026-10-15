@@ -18,7 +18,8 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_outputs);
 
 // Experimental: a complete initial text prompt, sequence 0, final-token logits only.
-// Limits are bytes, exclude model and persistent context allocations, and must be nonzero.
+// Limits are bytes and exclude model and persistent context allocations.
+// The host, expert and compute limits must be nonzero.
 // max_compute_bytes bounds scheduler buffers, not backend-private kernel workspaces.
 struct llama_layered_prefill_params {
     uint32_t n_ubatch = 256;
@@ -28,7 +29,10 @@ struct llama_layered_prefill_params {
     size_t max_compute_bytes = size_t(8) << 30;
     bool require_gpu = true; // false enables CPU correctness testing
     bool pipeline = true;
-    size_t max_transfer_bytes = size_t(512) << 20; // combined device and pinned activation buffers
+    size_t max_transfer_bytes = size_t(512) << 20; // activation device buffers and all pinned staging
+    bool weight_prefetch = true;
+    size_t max_prefetch_bytes = size_t(6) << 30; // additional next-layer device weights
+    size_t prefetch_headroom_bytes = size_t(512) << 20;
 };
 
 struct llama_layered_prefill_stats {
@@ -42,6 +46,13 @@ struct llama_layered_prefill_stats {
     uint32_t input_prefetches = 0;
     uint32_t async_output_batches = 0;
     bool pipeline_active = false;
+    uint32_t weight_prefetches = 0;
+    uint32_t weight_prefetch_skips = 0;
+    uint32_t weight_prefetch_allocation_attempts = 0;
+    uint64_t prefetched_expert_bytes = 0;
+    uint64_t weight_prefetch_submit_bytes = 0;
+    size_t peak_prefetch_bytes = 0;
+    size_t prefetch_pinned_bytes = 0;
 };
 
 // Returns 0 on success, -1 on unsupported/invalid input, -2 on allocation/compute failure.

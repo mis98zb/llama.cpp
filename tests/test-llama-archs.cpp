@@ -607,7 +607,8 @@ static bool round_prefill_boundary(ggml_tensor * tensor, bool ask, void * data) 
     return true;
 }
 
-static int test_layered_prefill(size_t seed, float stdev, const char * target_backend, bool quantized, bool pipeline) {
+static int test_layered_prefill(size_t seed, float stdev, const char * target_backend,
+                                bool quantized, bool pipeline, int prefetch_mode = 0) {
     const auto tokens = get_tokens(137, 128, seed);
     uint64_t expected_copies = 0;
     uint32_t n_cases = 0;
@@ -656,6 +657,12 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             pp.require_gpu = false;
             pp.staging_type = staging;
             pp.pipeline = pipeline;
+            pp.weight_prefetch = prefetch_mode != 0;
+            if (prefetch_mode) {
+                pp.max_compute_bytes = size_t(64) << 20;
+                pp.prefetch_headroom_bytes = prefetch_mode == 3 ? SIZE_MAX : size_t(64) << 20;
+                pp.max_prefetch_bytes = prefetch_mode == 2 ? 1 : size_t(64) << 20;
+            }
             llama_layered_prefill_stats stats;
             const llama_token invalid = 128;
             if (llama_prefill_layered(layered.get(), &invalid, 1, pp) != -1) {
@@ -687,6 +694,20 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                 (stats.transfer_buffer_bytes == 0 || stats.async_output_batches != stats.microbatches ||
                  stats.input_prefetches != 3 * ((tokens.size() + ubatch - 1) / ubatch - 1))) {
                 throw std::runtime_error("layered prefill did not pipeline all activation transfers");
+            }
+            if (gpu && prefetch_mode == 1 &&
+                (stats.weight_prefetches != 3 || stats.weight_prefetch_skips != 0 ||
+                 stats.weight_prefetch_allocation_attempts != 3 ||
+                 stats.prefetched_expert_bytes != stats.expert_copy_bytes ||
+                 stats.weight_prefetch_submit_bytes != stats.prefetched_expert_bytes ||
+                 stats.peak_prefetch_bytes == 0 || stats.prefetch_pinned_bytes == 0)) {
+                throw std::runtime_error("next-layer expert weights were not prefetched during compute submission");
+            }
+            if (gpu && prefetch_mode >= 2 &&
+                (stats.weight_prefetches != 0 || stats.weight_prefetch_skips != 3 ||
+                 stats.weight_prefetch_allocation_attempts != 0 ||
+                 stats.prefetched_expert_bytes != 0 || stats.peak_prefetch_bytes != 0)) {
+                throw std::runtime_error("next-layer expert prefetch did not respect memory limits");
             }
             if (staging == GGML_TYPE_F32 && devices.empty()) {
                 std::vector<uint8_t> a(llama_state_seq_get_size(reference.second.get(), 0));
@@ -749,6 +770,14 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                 throw std::runtime_error("layered prefill expert budget failure retained a partial prefix");
             }
             pp.max_expert_bytes = size_t(6) << 30;
+            if (gpu && prefetch_mode == 1) {
+                pp.max_compute_bytes = stats.peak_compute_bytes - 1;
+                if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -2 ||
+                    llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                    throw std::runtime_error("prefetch execution did not clean up a reduced workspace budget");
+                }
+                pp.max_compute_bytes = size_t(8) << 30;
+            }
             pp.staging_type = GGML_TYPE_F32;
             if (llama_prefill_layered(layered.get(), tokens.data(), 1, pp) != 0) {
                 throw std::runtime_error("layered prefill did not recover after budget failure");
@@ -759,8 +788,9 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
                 throw std::runtime_error("single-token prefill after failure differs from ordinary decode");
             }
-            LOG("layered prefill: ubatch=%u staging=%s quantized=%d pipeline=%d, logits/state/decode/budgets OK, expert bytes=%" PRIu64 "\n",
-                ubatch, ggml_type_name(staging), quantized, stats.pipeline_active, stats.expert_copy_bytes);
+            LOG("layered prefill: ubatch=%u staging=%s quantized=%d pipeline=%d prefetch=%u skip=%u, logits/state/decode/budgets OK, expert bytes=%" PRIu64 "\n",
+                ubatch, ggml_type_name(staging), quantized, stats.pipeline_active,
+                stats.weight_prefetches, stats.weight_prefetch_skips, stats.expert_copy_bytes);
             ++n_cases;
         }
     }
@@ -1429,6 +1459,15 @@ int main(int argc, char ** argv) {
                         return result;
                     }
                 }
+            }
+            if (target_backend && ggml_backend_dev_type(ggml_backend_dev_by_name(target_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                for (int mode : {1, 2, 3}) {
+                    const int result = test_layered_prefill(seed, stdev, target_backend, true, true, mode);
+                    if (result != 0) {
+                        return result;
+                    }
+                }
+                return test_layered_prefill(seed, stdev, target_backend, true, false, 1);
             }
             return 0;
         }

@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 int main(int argc, char ** argv) {
@@ -22,6 +23,35 @@ int main(int argc, char ** argv) {
             pp.staging_type = std::strcmp(argv[i], "bf16") == 0 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
         } else if (std::strcmp(argv[i], "--no-pipeline") == 0) {
             pp.pipeline = false;
+        } else if (std::strcmp(argv[i], "--no-weight-prefetch") == 0) {
+            pp.weight_prefetch = false;
+        } else if (std::strcmp(argv[i], "--compute-budget-mib") == 0 ||
+                   std::strcmp(argv[i], "--prefetch-budget-mib") == 0 ||
+                   std::strcmp(argv[i], "--prefetch-headroom-mib") == 0) {
+            const char * option = argv[i];
+            if (++i == argc) {
+                std::fprintf(stderr, "%s requires a nonnegative MiB count\n", option);
+                return 1;
+            }
+            try {
+                size_t end = 0;
+                const auto value = std::stoull(argv[i], &end);
+                if (argv[i][0] == '-' || end != std::strlen(argv[i]) ||
+                    value > (std::numeric_limits<size_t>::max() >> 20)) {
+                    throw std::invalid_argument("invalid MiB count");
+                }
+                const size_t bytes = size_t(value) << 20;
+                if (std::strcmp(option, "--compute-budget-mib") == 0) {
+                    pp.max_compute_bytes = bytes;
+                } else if (std::strcmp(option, "--prefetch-budget-mib") == 0) {
+                    pp.max_prefetch_bytes = bytes;
+                } else {
+                    pp.prefetch_headroom_bytes = bytes;
+                }
+            } catch (const std::exception & e) {
+                std::fprintf(stderr, "%s: %s\n", option, e.what());
+                return 1;
+            }
         } else {
             common_args.push_back(argv[i]);
         }
@@ -34,7 +64,10 @@ int main(int argc, char ** argv) {
     const int common_argc = common_args.size();
     common_args.push_back(nullptr);
     if (!common_params_parse(common_argc, common_args.data(), params, LLAMA_EXAMPLE_COMMON,
-                            [](int, char **) { LOG("Layered prefill: --staging-type bf16|f32 (default bf16), --no-pipeline\n"); })) {
+                            [](int, char **) {
+                                LOG("Layered prefill: --staging-type bf16|f32, --no-pipeline, --no-weight-prefetch\n");
+                                LOG("Memory: --compute-budget-mib N, --prefetch-budget-mib N, --prefetch-headroom-mib N\n");
+                            })) {
         return 1;
     }
     if (params.n_parallel != 1 || params.n_predict < 0 || params.moe_cache_size != 0 ||
@@ -89,6 +122,11 @@ int main(int argc, char ** argv) {
                 stats.activation_read_bytes, stats.activation_write_bytes, stats.peak_compute_bytes);
         LOG_INF("pipeline=%d, transfer buffer bytes=%zu, input prefetches=%u, asynchronous output batches=%u\n",
                 stats.pipeline_active, stats.transfer_buffer_bytes, stats.input_prefetches, stats.async_output_batches);
+        LOG_INF("weight prefetches=%u, skipped=%u, allocation attempts=%u, prefetched bytes=%" PRIu64
+                ", submitted during compute=%" PRIu64 ", peak device bytes=%zu, pinned bytes=%zu\n",
+                stats.weight_prefetches, stats.weight_prefetch_skips, stats.weight_prefetch_allocation_attempts,
+                stats.prefetched_expert_bytes, stats.weight_prefetch_submit_bytes,
+                stats.peak_prefetch_bytes, stats.prefetch_pinned_bytes);
         llama_perf_context_print(ctx.get());
         const auto * vocab = llama_model_get_vocab(model.get());
         const size_t nv = llama_vocab_n_tokens(vocab);

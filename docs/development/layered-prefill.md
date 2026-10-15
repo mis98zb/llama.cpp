@@ -83,7 +83,7 @@ The standalone CUDA example loaded a locally generated tiny GGUF and completed b
 
 `llama_prefill_layered` in `src/llama-ext.h` accepts the complete tokenized prompt and returns the final token's logits through the ordinary logits getters. Sequence 0 starts at position 0. A subsequent ordinary decode starts at the prompt length. Unsupported configurations return `-1`; resource and execution failures return `-2`, with an explicit log message.
 
-The defaults are BF16 staging, microbatch 256, 16 GiB of host activation storage including pinned activation buffers, 6 GiB of expert storage, and 8 GiB of scheduler compute buffers. The activation pipeline has a separate 512 MiB combined device/pinned-buffer limit. C++ callers can set these limits through `llama_layered_prefill_params`. CPU execution requires `require_gpu = false` and is intended for correctness testing. Only one GPU is supported.
+The defaults are BF16 staging, microbatch 256, 16 GiB of host activation storage including pinned staging, 6 GiB of current-layer expert storage, and 8 GiB of scheduler compute buffers. The 512 MiB transfer budget covers activation device buffers and all pinned staging, including optional weight-prefetch bounce buffers. C++ callers can set these limits through `llama_layered_prefill_params`. CPU execution requires `require_gpu = false` and is intended for correctness testing. Only one GPU is supported.
 
 The separate `llama-layered-prefill` example uses the shared llama.cpp argument parser, keeps routed experts in plain CPU buffers, invokes the new path, reports copy statistics and then performs greedy ordinary decode. `--staging-type f32` selects the unrounded reference; the default is `bf16`. It raises the logical batch capacity to hold the complete prompt; `-ub` remains the physical microbatch bound. It does not enable the feature in the normal CLI or server.
 
@@ -110,6 +110,40 @@ KDA computation remains sequential in token order. This pipelines transfers, not
 For hidden size 4096, four streams, BF16 staging and microbatch 256, the device slots occupy 32 MiB and the pinned slots another 32 MiB, before backend padding. Both are charged to `max_transfer_bytes`; pinned bytes also count against `max_host_bytes`. Scheduler compute buffers, experts and persistent state are additional allocations.
 
 Statistics report active pipelining, allocated transfer bytes, next-input prefetches and asynchronous output batches. Tests require these counts to cover every eligible microbatch, not merely numerical parity. They also cover insufficient transfer budgets and retry after failure. These counters establish that the asynchronous path executed, not a hardware-overlap percentage or an end-to-end speedup.
+
+## Conditional next-layer expert prefetch
+
+`weight_prefetch = true` enables optional next-layer routed-expert prefetch on a GPU. This does not move KV/recurrent state between layers, and does not prefetch non-expert weights that the normal model configuration already manages.
+
+After allocating the current layer's first microbatch graph, the implementation checks the next expert bank's actual tensor formats, dimensions, backend padding and alignment. Before attempting an additional device allocation, it checks:
+
+- The bank fits both the normal per-layer expert limit and the separate `max_prefetch_bytes` limit (default 6 GiB).
+- Reported free device memory can hold the bank, additional scheduler-buffer growth up to `max_compute_bytes`, and `prefetch_headroom_bytes` (default 512 MiB).
+- Host and transfer budgets can hold two additional pinned bounce buffers.
+- The backend supports asynchronous copies, events and pinned storage.
+
+Free VRAM already excludes current weights, persistent state, activation slots and allocated compute buffers. Those allocations are not subtracted again. Only potential additional compute-buffer growth is reserved. This is deliberately conservative: a large configured compute budget can disable prefetch even when a smaller measured workload would fit.
+
+If the checks fail, no next-layer device allocation is attempted. Normal mandatory layer loading is retained. If allocation or pinned staging becomes unavailable after the check, a warning records the optional optimization's failure and normal loading is retained. Other model/compute errors are not suppressed.
+
+An accepted prefetch owns a second device expert bank and a separate upload stream. It uploads weight slices through two pinned buffers, each at most 8 MiB. The host queues a bounded share of the upload after submitting each current-layer microbatch, before waiting for compute. Slice events prevent reuse of pinned memory that DMA still reads. At the next layer boundary, the upload is completed before the bank is used, and that bank replaces the normal upload rather than duplicating it.
+
+Prefetch works with or without the activation pipeline. It never requires keeping two expert banks when space is insufficient. Pinned weight buffers count against both `max_host_bytes` and the remaining `max_transfer_bytes`; the additional expert bank counts against `max_prefetch_bytes`. Backend-private workspace and other processes can still change memory availability, so the headroom is not an allocation guarantee.
+
+The example accepts:
+
+- `--no-weight-prefetch` to disable the optimization.
+- `--compute-budget-mib N` to set the scheduler-buffer limit and corresponding growth reservation.
+- `--prefetch-budget-mib N` to limit the additional expert bank; zero forces skipping it.
+- `--prefetch-headroom-mib N` to set reserved free VRAM beyond the compute-buffer growth.
+
+Do not lower compute budgets only to force prefetch: an actual graph exceeding the compute limit still fails explicitly. The default 8 GiB compute reservation will normally skip prefetch on the local 4 GiB T1000. A smaller budget is appropriate only for the tiny synthetic model, not evidence that the real GLM model fits.
+
+Statistics distinguish accepted prefetches, skips, device-allocation attempts, prefetched bytes, bytes queued between compute submission and synchronization, peak active extra-bank bytes and pinned weight-staging bytes. Submission counters do not measure actual copy/compute overlap or speedup.
+
+GPU tests additionally cover a permitted prefetch, insufficient extra-bank budget, and an impossible free-memory headroom requirement. The skip cases require zero device-allocation attempts. They compare logits and subsequent decode, preserve once-per-layer expert byte counts, and retry after resource errors. Allowed prefetch is tested both with and without activation pipelining.
+
+Local validation passed 48 CUDA cases for each of seeds 42 and 17 on the T1000, along with the registered CPU test and the three existing hybrid architecture checks. The standalone synthetic-GGUF example reported one accepted prefetch and 589824 prefetched bytes when given an appropriate small-model compute budget. With the extra-bank budget set to zero it reported one skip and zero allocation attempts. With pinned memory disabled and the activation pipeline explicitly off, it also skipped weight prefetch and completed normal layered execution and decode. These remain synthetic checks, not real GLM/200K capacity or speed measurements.
 
 ## Reference
 
