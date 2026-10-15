@@ -17,6 +17,36 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Experimental: a complete initial text prompt, sequence 0, final-token logits only.
+// Limits are bytes, exclude model and persistent context allocations, and must be nonzero.
+// max_compute_bytes bounds scheduler buffers, not backend-private kernel workspaces.
+struct llama_layered_prefill_params {
+    uint32_t n_ubatch = 256;
+    ggml_type staging_type = GGML_TYPE_BF16;
+    size_t max_host_bytes = size_t(16) << 30;
+    size_t max_expert_bytes = size_t(6) << 30;
+    size_t max_compute_bytes = size_t(8) << 30;
+    bool require_gpu = true; // false enables CPU correctness testing
+};
+
+struct llama_layered_prefill_stats {
+    uint64_t expert_copy_bytes = 0;
+    uint64_t activation_read_bytes = 0;
+    uint64_t activation_write_bytes = 0;
+    uint32_t expert_layer_loads = 0;
+    uint32_t microbatches = 0;
+    size_t peak_compute_bytes = 0;
+};
+
+// Returns 0 on success, -1 on unsupported/invalid input, -2 on allocation/compute failure.
+// Once execution starts, failure clears the initially empty context; no partial prefix is retained.
+LLAMA_API int32_t llama_prefill_layered(
+        struct llama_context * ctx,
+        const llama_token * tokens,
+        int32_t n_tokens,
+        const llama_layered_prefill_params & params,
+        llama_layered_prefill_stats * stats = nullptr);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

@@ -673,19 +673,21 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     llm_build_delta_net_base(params), model(model) {
 
     ggml_tensor * cur;
-
-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
-    cb(inp, "inp_embd", -1);
+    const bool layered = params.prefill_layer >= 0;
+    const int first = layered ? params.prefill_layer : 0;
+    const int last  = layered ? first + 1 : n_layer;
+    GGML_ASSERT(first >= 0 && last <= n_layer);
 
     // recurrent state + K-only MLA cache through the generic hybrid input, plus the indexer cache
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
 
-    auto * inp_hyb   = build_inp_mem_hybrid_k();
+    auto * inp_hyb   = build_inp_mem_hybrid_k(!layered || !hparams.is_recr(first),
+                                            !layered || hparams.is_recr(first));
     auto * inp_rs    = inp_hyb->get_recr();
     auto * inp_attn  = inp_hyb->get_attn();
-    auto * inp_kpool = build_inp_kpool(mctx_hyb);
+    auto * inp_kpool = !layered || !hparams.is_recr(first) ? build_inp_kpool(mctx_hyb) : nullptr;
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = !layered || (last == n_layer && n_outputs > 0) ? build_inp_out_ids() : nullptr;
 
     const int64_t n_head_kda   = hparams.n_head();
     const int64_t head_dim     = hparams.n_embd_head_kda;
@@ -699,14 +701,24 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
     const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
-    cb(inpL, "hc_init", -1);
+    ggml_tensor * inpL;
+    if (first == 0) {
+        ggml_tensor * inp = build_inp_embd(model.tok_embd);
+        cb(inp, "inp_embd", -1);
+        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+        cb(inpL, "hc_init", -1);
+    } else {
+        res->t_prefill_in = ggml_new_tensor_3d(ctx0, params.prefill_type, n_embd, hc, n_tokens);
+        ggml_set_input(res->t_prefill_in);
+        ggml_set_name(res->t_prefill_in, "prefill_input");
+        inpL = ggml_cast(ctx0, res->t_prefill_in, GGML_TYPE_F32);
+    }
 
     ggml_tensor * prev_sel = nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
-        const auto & layer = model.layers[il];
+    for (int il = first; il < last; ++il) {
+        const auto & layer = params.prefill_weights ? *params.prefill_weights : model.layers[il];
 
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
@@ -771,6 +783,15 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
+    }
+
+    if (layered) {
+        res->t_prefill_out = ggml_cast(ctx0, inpL, params.prefill_type);
+        ggml_set_name(res->t_prefill_out, "prefill_output");
+        ggml_build_forward_expand(gf, res->t_prefill_out);
+        if (last != n_layer || n_outputs == 0) {
+            return;
+        }
     }
 
     // narrow to the output tokens, then collapse the streams

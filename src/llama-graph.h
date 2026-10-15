@@ -829,6 +829,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    int32_t prefill_layer = -1;
+    ggml_type prefill_type = GGML_TYPE_F32;
+    const llama_layer * prefill_weights = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -866,6 +870,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+        if (prefill_layer != other.prefill_layer || prefill_type != other.prefill_type ||
+            prefill_weights != other.prefill_weights) {
             return false;
         }
 
@@ -961,6 +969,8 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_prefill_in  = nullptr;
+    ggml_tensor * t_prefill_out = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1414,7 +1424,7 @@ struct llm_graph_context {
     //
 
     llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
-    llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
+    llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k(bool attn = true, bool recurrent = true) const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
 

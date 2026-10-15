@@ -10,6 +10,7 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-ext.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -80,6 +81,16 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
             tmp[i] = ggml_fp32_to_fp16(is_ssm_a ? -fabsf(val) : val);
         }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+    } else if (tensor->type == GGML_TYPE_Q4_K) {
+        std::vector<float> tmp(ne);
+        for (auto & v : tmp) {
+            v = dis(gen);
+        }
+        std::vector<uint8_t> quantized(ggml_nbytes(tensor));
+        const size_t bytes = ggml_quantize_chunk(tensor->type, tmp.data(), quantized.data(),
+                                                0, ne / tensor->ne[0], tensor->ne[0], nullptr);
+        GGML_ASSERT(bytes == quantized.size());
+        ggml_backend_tensor_set(tensor, quantized.data(), 0, bytes);
     } else {
         GGML_ABORT("fatal error");
     }
@@ -94,6 +105,7 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
+    LOG("  --layered-prefill        Test experimental GLM5-Next layer-major prefill\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -506,7 +518,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        uint32_t ubatch_size = 64, ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_data = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -520,8 +533,10 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.cb_eval = cb_eval;
+    ctx_params.cb_eval_user_data = cb_data;
     if (!encode) {
-        ctx_params.n_ubatch = 64;
+        ctx_params.n_ubatch = ubatch_size;
     }
     if (moe_cache_size > 0) {
         // the MoE cache is only used for small ubatches
@@ -571,6 +586,170 @@ static std::vector<float> get_logits(
         }
     }
     return ret;
+}
+
+static bool round_prefill_boundary(ggml_tensor * tensor, bool ask, void * data) {
+    const bool selected = *(const bool *) data && strncmp(tensor->name, "l_out-", 6) == 0 &&
+                          strcmp(tensor->name, "l_out-3") != 0;
+    if (ask) {
+        return selected;
+    }
+    if (!selected) {
+        return true;
+    }
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor));
+    std::vector<float> values(ggml_nelements(tensor));
+    ggml_backend_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
+    for (auto & value : values) {
+        value = ggml_bf16_to_fp32(ggml_fp32_to_bf16(value));
+    }
+    ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
+    return true;
+}
+
+static int test_layered_prefill(size_t seed, float stdev, const char * target_backend, bool quantized) {
+    const auto tokens = get_tokens(137, 128, seed);
+    uint64_t expected_copies = 0;
+    uint32_t n_cases = 0;
+    std::vector<ggml_backend_dev_t> devices;
+    if (target_backend) {
+        devices.push_back(ggml_backend_dev_by_name(target_backend));
+    }
+    const llama_model_tensor_buft_override overrides[] = {
+        { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() }, { nullptr, nullptr },
+    };
+    for (uint32_t ubatch : {7u, 32u, 64u}) {
+        for (ggml_type staging : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+            auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+            llama_model_saver ms(LLM_ARCH_GLM5_NEXT, metadata.get());
+            ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(4));
+            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, std::vector<uint32_t>{0, 1, 0, 1});
+            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(32));
+            if (quantized) {
+                ms.add_kv(LLM_KV_EMBEDDING_LENGTH, uint32_t(256));
+                ms.add_kv(LLM_KV_FEATURES_LENGTH, uint32_t(256));
+                ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH, uint32_t(256));
+                ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, uint32_t(256));
+                for (uint32_t il = 1; il < 4; ++il) {
+                    for (const char * part : {"gate", "up", "down"}) {
+                        ggml_tensor tensor = {};
+                        tensor.type = GGML_TYPE_Q4_K;
+                        tensor.ne[0] = tensor.ne[1] = 256;
+                        tensor.ne[2] = 2;
+                        tensor.ne[3] = 1;
+                        ggml_format_name(&tensor, "blk.%u.ffn_%s_exps.weight", il, part);
+                        gguf_add_tensor(metadata.get(), &tensor);
+                    }
+                }
+            }
+            bool rounding = staging == GGML_TYPE_BF16;
+            auto reference = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
+                                               LLAMA_SPLIT_MODE_LAYER, false, devices.empty() ? overrides : nullptr,
+                                               0, ubatch, rounding ? round_prefill_boundary : nullptr, &rounding);
+            auto candidate = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
+                                               LLAMA_SPLIT_MODE_LAYER, false, overrides, 0, ubatch);
+            auto & layered = candidate.second;
+            const auto logits = get_logits(reference.first.get(), reference.second.get(), tokens);
+            rounding = false;
+            llama_layered_prefill_params pp;
+            pp.n_ubatch = ubatch;
+            pp.require_gpu = false;
+            pp.staging_type = staging;
+            llama_layered_prefill_stats stats;
+            const llama_token invalid = 128;
+            if (llama_prefill_layered(layered.get(), &invalid, 1, pp) != -1) {
+                throw std::runtime_error("layered prefill accepted an invalid token");
+            }
+            if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp, &stats) != 0) {
+                throw std::runtime_error("layered prefill failed");
+            }
+            const size_t nv = llama_vocab_n_tokens(llama_model_get_vocab(reference.first.get()));
+            std::vector<float> expected(logits.end() - nv, logits.end());
+            std::vector<float> actual(llama_get_logits(layered.get()), llama_get_logits(layered.get()) + nv);
+            const double tolerance = devices.empty() && staging == GGML_TYPE_F32 ? 1e-10 : 1e-5;
+            if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
+                LOG_ERR("prefill mismatch: ubatch=%u staging=%s quantized=%d NMSE=%g tolerance=%g\n",
+                        ubatch, ggml_type_name(staging), quantized, nmse(expected, actual), tolerance);
+                throw std::runtime_error("layered prefill logits mismatch");
+            }
+            if (stats.expert_layer_loads != 3 || stats.expert_copy_bytes == 0 ||
+                (expected_copies && expected_copies != stats.expert_copy_bytes) ||
+                stats.microbatches != 4 * ((tokens.size() + ubatch - 1) / ubatch)) {
+                throw std::runtime_error("experts were not loaded once per layer");
+            }
+            expected_copies = stats.expert_copy_bytes;
+            if (staging == GGML_TYPE_F32 && devices.empty()) {
+                std::vector<uint8_t> a(llama_state_seq_get_size(reference.second.get(), 0));
+                std::vector<uint8_t> b(llama_state_seq_get_size(layered.get(), 0));
+                llama_state_seq_get_data(reference.second.get(), a.data(), a.size(), 0);
+                llama_state_seq_get_data(layered.get(), b.data(), b.size(), 0);
+                if (a != b) {
+                    throw std::runtime_error("layered prefill final sequence state mismatch");
+                }
+            }
+            // Decode both prefixes with the same weight placement and backend kernels.
+            llama_context_params decode_params = llama_context_default_params();
+            decode_params.n_ctx = 256;
+            decode_params.n_ubatch = ubatch;
+            decode_params.n_threads = decode_params.n_threads_batch = 4;
+            llama_context_ptr replay(llama_init_from_model(candidate.first.get(), decode_params));
+            std::vector<uint8_t> prefix(llama_state_seq_get_size(reference.second.get(), 0));
+            if (!replay || llama_state_seq_get_data(reference.second.get(), prefix.data(), prefix.size(), 0) != prefix.size() ||
+                llama_state_seq_set_data(replay.get(), prefix.data(), prefix.size(), 0) != prefix.size()) {
+                throw std::runtime_error("failed to restore reference prefix for decode comparison");
+            }
+            common_batch next_ref(replay.get()), next_layer(layered.get());
+            next_ref.add(17, tokens.size(), 0, true);
+            next_layer.add(17, tokens.size(), 0, true);
+            if (llama_process(replay.get(), LLAMA_PROCESS_TYPE_DECODE, next_ref.get()) ||
+                llama_process(layered.get(), LLAMA_PROCESS_TYPE_DECODE, next_layer.get())) {
+                throw std::runtime_error("decode after layered prefill failed");
+            }
+            expected.assign(llama_get_logits(replay.get()), llama_get_logits(replay.get()) + nv);
+            actual.assign(llama_get_logits(layered.get()), llama_get_logits(layered.get()) + nv);
+            if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
+                throw std::runtime_error("decode after layered prefill logits mismatch");
+            }
+            if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -1) {
+                throw std::runtime_error("layered prefill accepted a nonempty context");
+            }
+            llama_memory_clear(llama_get_memory(layered.get()), true);
+            pp.max_host_bytes = 1;
+            if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -2) {
+                throw std::runtime_error("layered prefill ignored host budget");
+            }
+            pp.max_host_bytes = size_t(16) << 30;
+            pp.max_compute_bytes = 1;
+            if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -2 ||
+                llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                throw std::runtime_error("layered prefill workspace failure retained a partial prefix");
+            }
+            pp.max_compute_bytes = size_t(8) << 30;
+            pp.max_expert_bytes = 1;
+            if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -2 ||
+                llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                throw std::runtime_error("layered prefill expert budget failure retained a partial prefix");
+            }
+            pp.max_expert_bytes = size_t(6) << 30;
+            pp.staging_type = GGML_TYPE_F32;
+            if (llama_prefill_layered(layered.get(), tokens.data(), 1, pp) != 0) {
+                throw std::runtime_error("layered prefill did not recover after budget failure");
+            }
+            llama_memory_clear(llama_get_memory(reference.second.get()), true);
+            expected = get_logits(reference.first.get(), reference.second.get(), {tokens[0]});
+            actual.assign(llama_get_logits(layered.get()), llama_get_logits(layered.get()) + nv);
+            if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
+                throw std::runtime_error("single-token prefill after failure differs from ordinary decode");
+            }
+            LOG("layered prefill: ubatch=%u staging=%s quantized=%d, logits/state/decode/budgets OK, expert bytes=%" PRIu64 "\n",
+                ubatch, ggml_type_name(staging), quantized, stats.expert_copy_bytes);
+            ++n_cases;
+        }
+    }
+    if (n_cases != 6) {
+        throw std::runtime_error("not all layered prefill test cases executed");
+    }
+    return 0;
 }
 
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
@@ -1140,6 +1319,7 @@ int main(int argc, char ** argv) {
     float stdev = 0.1f;
     std::string out;
     const char * target_backend = nullptr;
+    bool layered_prefill = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1147,6 +1327,8 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
+        } else if (strcmp(argv[i], "--layered-prefill") == 0) {
+            layered_prefill = true;
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -1220,6 +1402,11 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (layered_prefill) {
+            common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
+            const int result = test_layered_prefill(seed, stdev, target_backend, false);
+            return result != 0 ? result : test_layered_prefill(seed, stdev, target_backend, true);
+        }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }

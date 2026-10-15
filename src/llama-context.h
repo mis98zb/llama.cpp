@@ -152,6 +152,10 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    int prefill_layered(const llama_token * tokens, int32_t n_tokens,
+                       const llama_layered_prefill_params & params,
+                       llama_layered_prefill_stats * stats);
+
     //
     // state save/load
     //
