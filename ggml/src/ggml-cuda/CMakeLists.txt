@@ -131,6 +131,10 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+    if (TARGET CUDA::nvtx3)
+        target_link_libraries(ggml-cuda PRIVATE CUDA::nvtx3)
+        set_property(SOURCE ggml-cuda.cu APPEND PROPERTY COMPILE_DEFINITIONS GGML_CUDA_NVTX=1)
+    endif()
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)

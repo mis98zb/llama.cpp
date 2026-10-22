@@ -10,6 +10,7 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-prefill-plan.h"
 #include "../src/llama-memory-hybrid-idx.h"
@@ -108,6 +109,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --layered-prefill        Test experimental GLM5-Next layer-major prefill\n");
+    LOG("  --qwen-prefill           Test Qwen3.5 layer-major and route-driven prefill\n");
     LOG("  --layered-planner        Test grouped execution and joint planning\n");
     LOG("  --layered-prefix         Test resident hybrid prefix reuse\n");
     LOG("  -h, --help               Show this help message\n\n");
@@ -524,7 +526,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
         uint32_t ubatch_size = 64, ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_data = nullptr,
-        ggml_type cache_k = GGML_TYPE_F16) {
+        ggml_type cache_k = GGML_TYPE_F16, int32_t gpu_layers = -1, bool defer_compute = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -533,6 +535,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
+    if (gpu_layers >= 0) {
+        model_params.n_gpu_layers = gpu_layers;
+    }
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -558,7 +563,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!model) {
         throw std::runtime_error("failed to create llama model");
     }
-    llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+    llama_context_ptr lctx(defer_compute ?
+        llama_init_from_model_layered(model.get(), ctx_params) : llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
     }
@@ -641,7 +647,10 @@ static gguf_context_ptr layered_metadata(bool quantized) {
 }
 
 static int test_layered_prefill(size_t seed, float stdev, const char * target_backend,
-                                bool quantized, bool pipeline, int prefetch_mode = 0, uint32_t group_layers = 1) {
+                                bool quantized, bool pipeline, int prefetch_mode = 0, uint32_t group_layers = 1,
+                                bool qwen = false, uint32_t slots = 0, bool cpu_non_experts = true,
+                                bool stream_weights = false, ggml_type cache_type = GGML_TYPE_F16,
+                                bool merge_gate_up = false, bool defer_static_upload = false) {
     const auto tokens = get_tokens(137, 128, seed);
     uint64_t expected_copies = 0;
     uint32_t n_cases = 0;
@@ -652,16 +661,90 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
     const llama_model_tensor_buft_override overrides[] = {
         { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() }, { nullptr, nullptr },
     };
-    for (uint32_t ubatch : {7u, 32u, 64u}) {
+    const llama_model_tensor_buft_override streamed[] = {
+        { ".*", ggml_backend_cpu_buffer_type() }, { nullptr, nullptr },
+    };
+    for (uint32_t ubatch : qwen ? std::vector<uint32_t>{1, 3, 7} : std::vector<uint32_t>{7, 32, 64}) {
         for (ggml_type staging : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
-            auto metadata = layered_metadata(quantized);
+            auto metadata = qwen ? get_gguf_ctx(LLM_ARCH_QWEN35MOE, true) : layered_metadata(quantized);
+            if (qwen) {
+                llama_model_saver ms(LLM_ARCH_QWEN35MOE, metadata.get());
+                ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(4));
+                ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(merge_gate_up ? 128 : 16));
+                ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, uint32_t(256));
+                if (quantized) {
+                    ms.add_kv(LLM_KV_EMBEDDING_LENGTH, uint32_t(256));
+                    ms.add_kv(LLM_KV_FEATURES_LENGTH, uint32_t(256));
+                    for (uint32_t il = 0; il < 4; ++il) {
+                        for (const char * part : {"gate", "up", "down"}) {
+                            ggml_tensor tensor = {};
+                            tensor.type = GGML_TYPE_Q4_K;
+                            tensor.ne[0] = tensor.ne[1] = 256;
+                            tensor.ne[2] = merge_gate_up ? 128 : 16;
+                            tensor.ne[3] = 1;
+                            ggml_format_name(&tensor, "blk.%u.ffn_%s_exps.weight", il, part);
+                            gguf_add_tensor(metadata.get(), &tensor);
+                        }
+                        if (merge_gate_up) {
+                            ggml_tensor tensor = {};
+                            tensor.type = GGML_TYPE_Q4_K;
+                            tensor.ne[0] = 256;
+                            tensor.ne[1] = 512;
+                            tensor.ne[2] = 128;
+                            tensor.ne[3] = 1;
+                            ggml_format_name(&tensor, "blk.%u.ffn_gate_up_exps.weight", il);
+                            gguf_add_tensor(metadata.get(), &tensor);
+                        }
+                    }
+                }
+            }
             bool rounding = staging == GGML_TYPE_BF16;
+            ggml_context_ptr split_context;
+            ggml_backend_buffer_ptr split_buffer;
             auto reference = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
                                                LLAMA_SPLIT_MODE_LAYER, false, devices.empty() ? overrides : nullptr,
-                                               0, ubatch, rounding ? round_prefill_boundary : nullptr, &rounding);
+                                               0, ubatch, rounding ? round_prefill_boundary : nullptr, &rounding, cache_type);
             auto candidate = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
-                                               LLAMA_SPLIT_MODE_LAYER, false, overrides, 0, ubatch);
+                                               LLAMA_SPLIT_MODE_LAYER, false, stream_weights ? streamed : overrides, 0, ubatch,
+                                               nullptr, nullptr, cache_type,
+                                               stream_weights ? INT32_MAX : (qwen && cpu_non_experts ? 0 : -1),
+                                               stream_weights);
             auto & layered = candidate.second;
+            if (merge_gate_up) {
+                split_context.reset(ggml_init({8 * ggml_tensor_overhead(), nullptr, true}));
+                if (!split_context) {
+                    throw std::runtime_error("failed to allocate split gate/up fixture metadata");
+                }
+                std::vector<std::pair<ggml_tensor *, ggml_tensor *>> splits;
+                for (auto & layer : candidate.first->layers) {
+                    auto * source = layer.ffn_gate_up_exps;
+                    if (!source || !ggml_backend_buffer_is_host(source->buffer)) {
+                        throw std::runtime_error("split gate/up fixture requires host-resident merged weights");
+                    }
+                    auto * gate = ggml_new_tensor_3d(split_context.get(), source->type,
+                        source->ne[0], source->ne[1] / 2, source->ne[2]);
+                    auto * up = ggml_dup_tensor(split_context.get(), gate);
+                    splits.emplace_back(gate, up);
+                }
+                split_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(split_context.get(), ggml_backend_cpu_buffer_type()));
+                if (!split_buffer) {
+                    throw std::runtime_error("failed to allocate split gate/up fixture weights");
+                }
+                for (size_t il = 0; il < splits.size(); ++il) {
+                    auto & layer = candidate.first->layers[il];
+                    const auto * source = layer.ffn_gate_up_exps;
+                    const auto pair = splits[il];
+                    const size_t bytes = pair.first->nb[2];
+                    for (int64_t e = 0; e < source->ne[2]; ++e) {
+                        const auto * data = static_cast<const uint8_t *>(source->data) + e * source->nb[2];
+                        ggml_backend_tensor_set(pair.first, data, e * bytes, bytes);
+                        ggml_backend_tensor_set(pair.second, data + bytes, e * bytes, bytes);
+                    }
+                    layer.ffn_gate_up_exps = nullptr;
+                    layer.ffn_gate_exps = pair.first;
+                    layer.ffn_up_exps = pair.second;
+                }
+            }
             const auto logits = get_logits(reference.first.get(), reference.second.get(), tokens);
             rounding = false;
             llama_layered_prefill_params pp;
@@ -670,6 +753,10 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             pp.staging_type = staging;
             pp.pipeline = pipeline;
             pp.group_layers = group_layers;
+            pp.expert_slots = slots;
+            pp.stream_weights = stream_weights;
+            pp.merge_gate_up = merge_gate_up;
+            pp.defer_static_upload = defer_static_upload;
             pp.weight_prefetch = prefetch_mode != 0;
             if (prefetch_mode) {
                 pp.max_compute_bytes = size_t(64) << 20;
@@ -677,6 +764,24 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                 pp.max_prefetch_bytes = prefetch_mode == 2 ? 1 : size_t(64) << 20;
             }
             llama_layered_prefill_stats stats;
+            if (devices.empty()) {
+                pp.profile_gpu = true;
+                if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -1 ||
+                    llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                    throw std::runtime_error("GPU profiling accepted CPU execution or changed its state");
+                }
+                pp.profile_gpu = false;
+                for (bool merged : {false, true}) {
+                    pp.merge_gate_up = merged;
+                    pp.defer_static_upload = !merged;
+                    if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -1 ||
+                        llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                        throw std::runtime_error("streamed GPU optimization accepted CPU execution or changed state");
+                    }
+                }
+                pp.merge_gate_up = merge_gate_up;
+                pp.defer_static_upload = defer_static_upload;
+            }
             const llama_token invalid = 128;
             if (llama_prefill_layered(layered.get(), &invalid, 1, pp) != -1) {
                 throw std::runtime_error("layered prefill accepted an invalid token");
@@ -693,31 +798,56 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                         ubatch, ggml_type_name(staging), quantized, nmse(expected, actual), tolerance);
                 throw std::runtime_error("layered prefill logits mismatch");
             }
-            if (stats.expert_layer_loads != 3 || stats.expert_copy_bytes == 0 ||
-                (expected_copies && expected_copies != stats.expert_copy_bytes) ||
+            if (stats.expert_layer_loads != (qwen ? 4u : 3u) || stats.expert_copy_bytes == 0 ||
+                (!slots && expected_copies && expected_copies != stats.expert_copy_bytes) ||
                 stats.groups.size() != (4 + group_layers - 1) / group_layers ||
                 stats.microbatches != stats.groups.size() * ((tokens.size() + ubatch - 1) / ubatch)) {
                 throw std::runtime_error("experts were not loaded once per layer");
             }
             expected_copies = stats.expert_copy_bytes;
+            if (stats.merged_expert_layers != (merge_gate_up ? 4u : 0u)) {
+                throw std::runtime_error("streamed gate/up packing did not use the merged expert graph");
+            }
+            if (stream_weights && (stats.static_layer_loads != 4 || stats.static_copy_bytes == 0 ||
+                                   stats.peak_static_bytes == 0)) {
+                throw std::runtime_error("non-expert layer weights were not streamed once per layer");
+            }
+            if (slots && (stats.expert_cache_misses == 0 || stats.expert_cache_hits == 0 ||
+                          stats.peak_expert_bytes == 0 ||
+                          stats.expert_cache_hits + stats.expert_cache_misses > tokens.size() * 2 * 4)) {
+                throw std::runtime_error("route-driven expert cache was not used");
+            }
             const bool gpu = !devices.empty() && ggml_backend_dev_type(devices[0]) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (stream_weights && gpu && (stats.expert_allocations > 2 || stats.expert_reuses < 2)) {
+                throw std::runtime_error("streamed expert device banks were not reused");
+            }
             if (stats.pipeline_active != (pipeline && gpu)) {
                 throw std::runtime_error("layered prefill pipeline was not activated as requested");
+            }
+            if (slots && gpu && pipeline &&
+                (stats.demand_async_bytes != stats.expert_copy_bytes || stats.demand_overlap_batches == 0 ||
+                 stats.demand_pinned_bytes == 0)) {
+                throw std::runtime_error("expert uploads did not use the shared-compute overlap path");
             }
             if (stats.pipeline_active &&
                 (stats.transfer_buffer_bytes == 0 || stats.async_output_batches != stats.microbatches ||
                  stats.input_prefetches != (stats.groups.size() - 1) * ((tokens.size() + ubatch - 1) / ubatch - 1))) {
                 throw std::runtime_error("layered prefill did not pipeline all activation transfers");
             }
-            if (gpu && prefetch_mode == 1 &&
+            const uint64_t first_layer_bytes = qwen ? stats.expert_copy_bytes / 4 : 0;
+            if (stream_weights && gpu && prefetch_mode == 1 &&
+                (stats.static_prefetches != 3 || stats.static_prefetch_skips != 0)) {
+                throw std::runtime_error("known next-layer static weights were not prefetched");
+            }
+            if (!stream_weights && gpu && prefetch_mode == 1 &&
                 (stats.weight_prefetches != 3 || stats.weight_prefetch_skips != 0 ||
                  stats.weight_prefetch_allocation_attempts != 3 ||
-                 stats.prefetched_expert_bytes != stats.expert_copy_bytes ||
+                 stats.prefetched_expert_bytes != stats.expert_copy_bytes - first_layer_bytes ||
                  stats.weight_prefetch_submit_bytes != stats.prefetched_expert_bytes ||
                  stats.peak_prefetch_bytes == 0 || stats.prefetch_pinned_bytes == 0)) {
                 throw std::runtime_error("next-layer expert weights were not prefetched during compute submission");
             }
-            if (gpu && prefetch_mode >= 2 &&
+            if (!stream_weights && gpu && prefetch_mode >= 2 &&
                 (stats.weight_prefetches != 0 || stats.weight_prefetch_skips != 3 ||
                  stats.weight_prefetch_allocation_attempts != 0 ||
                  stats.prefetched_expert_bytes != 0 || stats.peak_prefetch_bytes != 0)) {
@@ -737,6 +867,7 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             decode_params.n_ctx = 256;
             decode_params.n_ubatch = ubatch;
             decode_params.n_threads = decode_params.n_threads_batch = 4;
+            decode_params.type_k = decode_params.type_v = cache_type;
             llama_context_ptr replay(llama_init_from_model(candidate.first.get(), decode_params));
             std::vector<uint8_t> prefix(llama_state_seq_get_size(reference.second.get(), 0));
             if (!replay || llama_state_seq_get_data(reference.second.get(), prefix.data(), prefix.size(), 0) != prefix.size() ||
@@ -784,6 +915,32 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                 throw std::runtime_error("layered prefill expert budget failure retained a partial prefix");
             }
             pp.max_expert_bytes = size_t(6) << 30;
+            if (stream_weights) {
+                pp.max_static_bytes = 1;
+                if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -2 ||
+                    llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                    throw std::runtime_error("static weight budget failure retained a partial prefix");
+                }
+                pp.max_static_bytes = size_t(256) << 20;
+                if (gpu) {
+                    pp.max_device_bytes = 1;
+                    if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -2 ||
+                        llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                        throw std::runtime_error("device working-set budget failure retained a partial prefix");
+                    }
+                    pp.max_device_bytes = 0;
+                }
+            }
+            if (slots) {
+                pp.expert_slots = 2;
+                pp.n_ubatch = ubatch;
+                if (ubatch > 1 &&
+                    (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -2 ||
+                     llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0)) {
+                    throw std::runtime_error("expert slot exhaustion did not fail and clear partial state");
+                }
+                pp.expert_slots = slots;
+            }
             if (gpu && prefetch_mode == 1) {
                 pp.max_compute_bytes = stats.peak_compute_bytes - 1;
                 if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -2 ||
@@ -1781,6 +1938,7 @@ int main(int argc, char ** argv) {
     bool layered_planner = false;
     bool joint_only = false;
     bool layered_prefix = false;
+    bool qwen_prefill = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1790,6 +1948,8 @@ int main(int argc, char ** argv) {
             return 0;
         } else if (strcmp(argv[i], "--layered-prefill") == 0) {
             layered_prefill = true;
+        } else if (strcmp(argv[i], "--qwen-prefill") == 0) {
+            qwen_prefill = true;
         } else if (strcmp(argv[i], "--layered-planner") == 0) {
             layered_planner = true;
         } else if (strcmp(argv[i], "--joint-only") == 0) {
@@ -1870,6 +2030,43 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (qwen_prefill) {
+            common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
+            for (bool quantized : {false, true}) {
+                for (bool pipeline : {false, true}) {
+                    for (uint32_t slots : {0u, 14u}) {
+                        if (test_layered_prefill(seed, stdev, target_backend, quantized, pipeline, 0, 1, true, slots)) {
+                            return 1;
+                        }
+                    }
+                }
+            }
+            if (target_backend) {
+                if (test_layered_prefill(seed, stdev, target_backend, true, true, 1, 1, true)) {
+                    return 1;
+                }
+                for (uint32_t slots : {0u, 14u}) {
+                    if (test_layered_prefill(seed, stdev, target_backend, true, true, 1, 1, true, slots, false, true)) {
+                        return 1;
+                    }
+                }
+                if (test_layered_prefill(seed, stdev, target_backend, true, true, 0, 1, true, 14, false, true, GGML_TYPE_Q8_0)) {
+                    return 1;
+                }
+                for (bool merge : {false, true}) {
+                    if (test_layered_prefill(seed, stdev, target_backend, true, true, 1, 1, true, 0,
+                                            false, true, GGML_TYPE_Q8_0, merge, true)) {
+                        return 1;
+                    }
+                }
+                if (test_layered_prefill(seed, stdev, target_backend, true, false, 0, 1, true, 0,
+                                        false, true, GGML_TYPE_F16, true, false)) {
+                    return 1;
+                }
+                return test_layered_prefill(seed, stdev, target_backend, true, true, 0, 1, true, 14, false);
+            }
+            return test_layered_prefill(seed, stdev, target_backend, true, false, 0, 1, true, 14, true, true);
+        }
         if (layered_prefix) {
             common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
             const int status = test_prefix_prefill(seed, stdev, target_backend, GGML_TYPE_F16);

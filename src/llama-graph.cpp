@@ -1147,22 +1147,24 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    if (inp_attn) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
-    if (inp_attn->self_k_rot) {
-        mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
-    }
+        if (inp_attn->self_k_rot) {
+            mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
+        }
 
-    if (inp_attn->self_v_rot) {
-        mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+        if (inp_attn->self_v_rot) {
+            mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+        }
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs && inp_rs->s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1174,6 +1176,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+    if (!inp_attn || !inp_rs) {
+        return false;
+    }
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
 
     this->mctx = mctx;
@@ -1389,6 +1394,7 @@ void llm_graph_result::reset() {
     t_h_nextn     = nullptr;
     t_prefill_in  = nullptr;
     t_prefill_out = nullptr;
+    t_prefill_ids = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1566,6 +1572,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    prefill_expert_map(params.prefill_expert_map),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
@@ -1671,7 +1678,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+        ggml_mul_mat_id(ctx0, moe_cache ? moe_cache->get_experts(w) : w, cur, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2291,8 +2298,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    if (prefill_expert_map) {
+        res->t_prefill_ids = selected_experts;
+        cb(weights, "prefill_expert_route", il);
+    }
+
+    if (prefill_expert_overlap) {
+        ggml_build_forward_expand(gf, prefill_expert_overlap);
+    }
+
+    ggml_tensor * slots;
+    if (prefill_expert_map) {
+        slots = ggml_reshape_2d(ctx0,
+            ggml_get_rows(ctx0, prefill_expert_map,
+                ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used * n_tokens)),
+            n_expert_used, n_tokens);
+    } else {
+        slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -3902,11 +3925,11 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
     );
 }
 
-llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
+llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid(bool attn, bool recurrent) const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
-    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_rs   = recurrent ? build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr()) : nullptr;
+    auto inp_attn = attn ? build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn()) : nullptr;
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

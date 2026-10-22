@@ -167,7 +167,7 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params, bool defer_compute) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -552,6 +552,7 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
+        sched_defer_compute = defer_compute;
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -755,6 +756,17 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
     resolve_fused_ops(mctx.get(), n_seqs);
+
+    if (sched_defer_compute) {
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), true);
+        if (!gf) {
+            throw std::runtime_error("failed to initialize deferred compute graph metadata");
+        }
+        graph_has_logits = get_gf_res_reserve()->get_logits() != nullptr;
+        ggml_backend_sched_reset(sched.get());
+        sched_defer_compute = false;
+        return;
+    }
 
     // reserve worst-case graph
     int n_splits_pp        = -1;
@@ -4023,9 +4035,9 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
-llama_context * llama_init_from_model(
+static llama_context * llama_init_from_model_impl(
                  llama_model * model,
-        llama_context_params   params) {
+        llama_context_params   params, bool defer_compute) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
@@ -4113,7 +4125,7 @@ llama_context * llama_init_from_model(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, params, defer_compute);
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -4128,6 +4140,14 @@ llama_context * llama_init_from_model(
     }
 
     return nullptr;
+}
+
+llama_context * llama_init_from_model(llama_model * model, llama_context_params params) {
+    return llama_init_from_model_impl(model, params, false);
+}
+
+llama_context * llama_init_from_model_layered(llama_model * model, llama_context_params params) {
+    return llama_init_from_model_impl(model, params, true);
 }
 
 // deprecated

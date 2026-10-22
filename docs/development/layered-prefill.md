@@ -1,4 +1,4 @@
-# Experimental layer-major prefill for GLM5-Next
+# Experimental layer-major prefill for GLM5-Next and Qwen3.5 MoE
 
 ## Goal and scope
 
@@ -234,15 +234,256 @@ $env:CUDA_VISIBLE_DEVICES = '2'
 
 These are synthetic correctness/resource-policy checks on the local CPU and SM75 GPU. They do not establish real GLM-5.3-Flash accuracy, SM86/20GB capacity, 200K speed or tuning optimality.
 
+## Qwen3.5 MoE route-driven prefill
+
+Qwen3.5 MoE supports manual layer groups and an initially empty, single-sequence text context. Its group boundaries contain `[hidden_size, suffix_tokens]` activations, not GLM's four mHC streams. Each group replays the attention and recurrent allocation metadata without copying or rolling back cache tensors. Layers consume microbatches in position order. Ordinary decode can continue from the resulting KV, convolution and DeltaNet state. Automatic planning and resident-prefix reuse remain GLM-only; Qwen requests for either are rejected explicitly.
+
+With `--expert-slots 0` (the default), complete routed expert banks are uploaded once per layer. This reference supports multiple-layer groups and optional complete-bank next-group prefetch. Both merged gate/up and separate gate/up tensors are supported. Non-expert weight placement still follows ordinary model offload settings.
+
+`--expert-slots N` enables a compact, single-layer cache. Only experts selected by the actual router are uploaded, and resident experts are reused across microbatches. A FIFO replacement policy protects every expert needed by the current microbatch. Router probabilities and per-expert scales retain their original expert indices; only weight lookup uses compact slot indices. The cache does not predict future routes.
+
+The selected expert union of each microbatch must fit the configured slots. Exhaustion reports an error and clears partial context state; it does not silently omit experts, change the batch size or fall back to CPU. Choosing at least `top_k * n_ubatch` slots, capped at the model's expert count, guarantees capacity independently of routing. Fewer slots are an explicit workload-dependent choice.
+
+Routing callbacks match the original router and shared-branch tensors exactly, not derived contiguous views with the same name prefix. Returning false from an evaluation callback aborts the entire scheduled graph, including later backend splits; resource errors must not reach expert kernels with invalid slots.
+
+On CUDA with pipelining enabled, missing experts are staged in bounded pinned host memory and uploaded on a separate stream after routing. The graph schedules the shared expert branch between routing and routed-expert evaluation. A transfer event is synchronized after the shared branch, before slot lookup or routed-expert kernels can consume the new weights. Previous microbatch computation and transfers finish before slots or staging storage are reused. `--no-pipeline` selects synchronous uploads and activation transfers.
+
+This overlaps eligible weight transfer with the current microbatch's shared expert work, not concurrent cross-layer or cross-microbatch graph execution. Shared expert work can execute on CPU when non-expert weights are CPU-resident. Asynchronous byte and overlap-window counters establish that this scheduling path ran; they do not measure physical overlap or prove a speedup.
+
+Router probabilities, selected-weight normalization, shared FFN arithmetic and layer residual output use the layer's configured backend in both reference and route-driven execution. Changing branch order must not silently move these operations between CPU and GPU. Real-model checks exposed a one-ULP difference in selected-weight normalization that amplified across layers; expert matrices and selected IDs were identical. Keep routing arithmetic placement fixed instead of relaxing the final-logit tolerance.
+
+Exact route-driven mode disables complete-bank next-layer prefetch: the next layer's routes are not known yet. The complete-bank reference retains that option. Neither mode claims to know later microbatches' routes.
+
+The expert budget includes the compact bank and its device slot map. Pinned expert staging counts against the remaining host and transfer budgets. Statistics separate peak bank bytes, cache hits/misses, actual uploaded bytes and pinned staging. Manual execution checks available device memory and safety headroom before allocating a group; this is a snapshot, not a guarantee against concurrent allocations by other processes.
+
+For a small-memory GPU, begin with non-expert weights on CPU and microbatch 8. Both Qwen3.5 models select eight routed experts per token, so 64 slots suffice for any routing at this batch size:
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES = '2'
+.\build-prefill-cuda\bin\llama-layered-prefill.exe -m D:\AI\Qwen3.5-35B-A3B\Qwen3.5-35B-A3B-Q4_K_M.gguf --device CUDA0 -ngl 0 -c 512 -ub 8 -b 512 -f D:\prompts\input.txt -n 0 -t 10 -tb 10 --staging-type f32 --expert-slots 64 --compute-budget-mib 256 --group-budget-mib 1536 --device-headroom-mib 128
+```
+
+For the 122B model, use the first GGUF shard with all shards in the same directory. Keep context length, prompt, microbatch, staging precision and non-expert placement identical when comparing complete groups and route-driven execution. The example reports prefill wall time excluding model/context creation, as well as expert upload and residency statistics. Board-memory samples include other processes and are not equivalent to process-exclusive VRAM measurements.
+
+Use an explicit group budget on Windows: CUDA's free-memory report alone does not reliably exclude WDDM residency migration into shared memory. A successful allocation above physical VRAM availability is not a valid GPU-only performance result. `--logits-file PATH` writes final-token F32 logits for direct comparisons of successful real-model runs.
+
+Size-only scheduler reservation preserves explicit backend assignments, like ordinary reservation. Otherwise measurement could place staging conversions on CPU while execution places them on GPU, invalidating both admission estimates and the synchronous reference. Mixed CPU non-expert/GPU expert tests cover this case.
+
+Qwen correctness tests cover F32/Q4_K experts, F32/BF16 activation staging, partial microbatches, synchronous/asynchronous operation, cache hits and replacement, slot exhaustion, resource limits, final state and subsequent decode. The CUDA candidate keeps non-expert weights on CPU to cover the small-memory placement used above.
+
+```powershell
+.\build-prefill-cuda\bin\test-llama-archs.exe --qwen-prefill --seed 42
+.\build-prefill-cuda\bin\test-llama-archs.exe --qwen-prefill --seed 42 --backend CUDA0
+```
+
+### All-layer streaming and large-microbatch evaluation
+
+`--stream-weights` keeps every model tensor in ordinary CPU buffers. The loader's logical GPU layer assignment is used only to place KV/recurrent state and select GPU execution; it does not make model weights GPU-resident. Embedding lookup and the final single-token output head remain on the host-backed path. All transformer-block weights, including attention, DeltaNet, router, shared experts and scales, are temporarily supplied to the current layer graph.
+
+Non-routed layer weights are packed with backend alignment into one pinned host buffer and uploaded with one bulk copy per layer. Known next-layer static weights can be prefetched without knowing routes. Routed experts use bounded double-buffered pinned uploads. Compatible device expert banks are recycled instead of allocated and freed at every layer; their contents are overwritten, and the banks are freed when the prefill request ends. Complete-bank mode may prefetch the next complete expert bank when admitted. Route-driven mode still waits for actual expert IDs.
+
+`llama_init_from_model_layered` initializes persistent state, fused-operation capability checks and scheduler metadata without reserving full-model prompt compute buffers. Actual layer graphs are measured and allocated later. Ordinary initialization would otherwise reserve a full-model worst-case graph before the layer-major planner can use that memory for its own working set.
+
+`--device-budget-mib` caps the accounted GPU working set: persistent state, current/prefetched/recycled weight banks, activation device slots and the larger of measured or already allocated device scheduler buffers. It excludes driver/context overhead and backend-private kernel allocations, so leave safety headroom. `--static-budget-mib` bounds current plus next static banks, while `--transfer-budget-mib` separately bounds activation slots and pinned staging. Optional prefetch yields to these budgets; an infeasible requested microbatch is rejected, not silently shrunk or run through a CPU fallback.
+
+Keep the CPU model genuinely loaded for throughput evaluation (`--load-mode none`) and provide enough host RAM. Use a long input, not the earlier 131-token capacity check. A context sweep keeps the same host model loaded while creating a fresh state/context for every requested microbatch. It logs each success/failure and returns status 2 if any sweep point fails. `--logits-file` appends `.ubN` during a sweep so comparisons can use the same microbatch and cache precision.
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES = '2'
+$env:GGML_CUDA_DISABLE_GRAPHS = '1'
+.\build-prefill-cuda\bin\llama-layered-prefill.exe --stream-weights --load-mode none -m D:\AI\Qwen3.5-35B-A3B\Qwen3.5-35B-A3B-Q4_K_M.gguf --device CUDA0 -c 4096 -b 4096 -n 0 -t 10 -tb 10 -fa on -f D:\prompts\long-input.txt --prompt-tokens 4096 --sweep-ubatch 128,256,512,1024,2048 --staging-type f32 --compute-budget-mib 768 --group-budget-mib 1536 --static-budget-mib 256 --transfer-budget-mib 2048 --device-budget-mib 1984 --device-headroom-mib 128
+```
+
+The input file must tokenize to at least 4096 tokens. Adjust the device budget to actual free VRAM; 1984 MiB is a local T1000 evaluation limit, not a portable default. CUDA Graph capture is disabled consistently for these tests because this implementation rebuilds layer graphs; this is not a claim about the isolated benefit of that switch or about an implementation with graph reuse.
+
+At large microbatches the routed union can cover nearly all 256 experts. Compare complete-bank mode with `--expert-slots 256` at the same microbatch, rather than forcing microbatch 8 to accommodate a 64-slot cache. Transfer counts, staging allocation and capacity failures are part of the comparison.
+
+Phase counters separate current-weight loading, graph/input setup, compute plus waits, and activation-copy submission. Prefetch staging work can appear in setup or compute/wait time; these are selected host wall-time intervals, not exhaustive partitions or isolated CUDA kernel/hardware-overlap measurements.
+
+#### Opt-in streamed compute experiments
+
+Two switches apply only to GPU execution with `--stream-weights` and complete expert banks (`--expert-slots 0`). Neither changes the default path, the host model, the requested microbatch, the total expert payload or the device-budget policy.
+
+- `--merge-gate-up` packs each expert's gate and up rows next to each other while filling the existing bounded pinned upload buffers. It reuses the existing merged `MUL_MAT_ID` graph, with no full-model host repack and no extra permanent device weights. Compatible banks retain this layout when recycled. Separate scales/biases, different gate/up formats or shapes, and activation clamping are rejected rather than silently changed.
+- `--defer-static-upload` allocates and packs the next static bank before compute submission, but queues its DMA after submitting the current graph and before the next expert upload loop. The pinned buffer remains alive until its ready event completes; a prepared bank cannot be consumed before submission. Without weight prefetch there is no next static bank to defer.
+
+For a paired comparison, add `--compare-optimizations -ub 2048 -n 0` to the long-input command instead of `--sweep-ubatch`. It loads the CPU model once and creates eight fresh contexts: baseline, merge, defer, both, then the reverse order. Prompt length, microbatch, state types and budgets remain fixed. A logits path gains `.caseN.ub2048`, so repeated points do not replace each other's results. This mode rejects other sweeps, prefix reuse, automatic planning and GPU profiling. Compare repeated end-to-end measurements; clock drift can make a sequence of different processes misleading.
+
+The existing backend performance runner includes the five actual dense shapes `(output,input) = (8192,2048), (4096,2048), (2048,4096), (512,2048), (2048,512)` at 2048 tokens with Q8_0, F16 and F32 weights, plus separate/merged Q4_K expert widths. On the local T1000, the first isolated Q8_0 products took 3.59-54.35 ms; F16 products took 12.90-180.24 ms, 3.3-3.9 times slower before charging dequantization. Therefore these experiments do not replace dense MMQ with F16 GEMM. That result does not predict Ampere Tensor Core performance. A later three-type scan measured F32 products about 8-17% faster than Q8_0 at these shapes, before dequantization and extra workspace; that is not an implemented end-to-end gain and would change activation arithmetic.
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES = '2'
+$env:GGML_CUDA_DISABLE_GRAPHS = '1'
+.\build-prefill-cuda\bin\test-backend-ops.exe perf -b CUDA0 -o MUL_MAT -p 'type_a=(q8_0|f16|f32),type_b=f32,m=(8192|4096|2048|512),n=2048,k='
+.\build-prefill-cuda\bin\test-backend-ops.exe perf -b CUDA0 -o MUL_MAT_ID -p 'type_a=q4_[Kk],type_b=f32,n_mats=256,n_used=8,b=0,m=(512|1024),n=2048,k=2048'
+```
+
+The expert microbenchmark measured 60.774 ms for a 512-row Q4_K product and 114.503 ms for the merged 1024-row product, about 5.8% less than two separate products. It excludes host packing and the rest of the layer.
+
+The same-host-model 35B Q4_K_M comparison (4096 tokens, microbatch 2048, the same 1984 MiB accounted device limit) returned:
+
+| Flags | Forward-order tokens/s | Reverse-order tokens/s |
+| --- | ---: | ---: |
+| None | 124.370 | 99.331 |
+| Merge gate/up | 114.787 | 99.469 |
+| Defer static upload | 103.577 | 100.238 |
+| Both | 100.967 | 100.300 |
+
+The baseline itself drifted substantially; the reverse-order points differ by about 1%, not a demonstrated material throughput improvement. Do not compare an earlier isolated 131-133 tokens/s baseline with an older 102-107 tokens/s sweep and credit the difference to these flags. They remain off by default. All eight final-logits arrays matched the unchanged baseline exactly (NMSE zero); expert/static transfer bytes and peak accounted device bytes were unchanged.
+
+A separate matched Nsight pair did establish the intended scheduling change: H2D/kernel coverage 84.223% -> 91.689%, with H2D without a kernel 587.913 -> 305.599 ms and identical 22709791476 H2D bytes. Both profiled outputs also matched the baseline exactly. This establishes more concurrent activity, not an end-to-end speedup. Validation covered 96 CUDA Qwen logits/state/decode/budget cases, including a split Q4 fixture whose fused payload crosses the 8 MiB upload boundary and merged-bank reuse without prefetch, plus the four CPU regression tests and 13 timeline analyzer cases.
+
+#### Large-batch local results
+
+The portable numeric record is [layered-prefill-results.json](layered-prefill-results.json). It includes settings, model revisions, the exact synthetic prompt recipe and checksum, run order, rejected cases, timing units and validation limitations. It deliberately excludes raw profiler metadata and machine-specific artifact paths.
+
+With 4096 tokens, F32 staging, Flash Attention, host-resident Q4_K_M weights and the limits above, the complete-bank sweep with prefetch requested measured:
+
+| Microbatch | 35B-A3B tokens/s | 122B-A10B tokens/s |
+| ---: | ---: | ---: |
+| 128 | 25.287 | 5.556 |
+| 256 | 36.412 | 9.376 |
+| 512 | 57.180 | 15.242 |
+| 1024 | 81.989 | Device-budget rejection |
+| 2048 | 102.201 | Device-budget rejection |
+
+The 122B 1024/2048 graphs required accounted working sets of 2138576000/2453156992 bytes, above the 2080374784-byte limit. Neither point was silently reduced or run through shared GPU memory. The fastest admitted 122B point was 512. Its subsequent eager-load comparison process could not allocate the roughly 76.5 GB host model under the then-current Windows commit limit, despite enough free physical RAM; the scan is complete, but those additional comparisons are not established by these measurements.
+
+The 122B logs report zero accepted and 47 skipped next-layer expert prefetches; static prefetch was also skipped 47 times. Its 15.242 tokens/s is therefore complete-bank loading without effective next-layer prefetch, not a successful double-bank prefetch result. The corrected `mmap+mlock` retry has not been run; no successful page locking or additional 122B comparison is claimed.
+
+At the same 35B microbatch 2048, no-prefetch complete loading measured 99.059 tokens/s, synchronous demand loading 100.946, and asynchronous demand loading 83.588. A complete-bank/prefetch repeat measured 106.685. All four comparisons produced identical final logits relative to the sweep reference (NMSE zero). An earlier isolated complete-bank/prefetch pilot reached 124.344; do not substitute that peak for the sustained sweep/repeat results.
+
+Complete loading uploaded 19461570560 expert bytes; demand loading uploaded 17346265088, about 10.9% fewer. Both uploaded 1585932800 static layer-weight bytes. At this large microbatch a 256-slot demand bank has essentially the same current-layer capacity as a complete bank, unlike the earlier 64-slot/microbatch-8 experiment.
+
+### GPU activity timeline and overlap
+
+`--profile-gpu` opts into a CUDA profiler capture range and NVTX annotations. It does not itself collect a timeline. The CUDA backend must have NVTX3 support (enabled when CMake provides `CUDA::nvtx3`), and Nsight Systems supplies the actual CUDA activity collector. Other backends are not presented as CUDA profiling. Use one manual prefill; CLI sweeps, automatic calibration and prefix demonstrations are rejected for capture.
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES = '2'
+$env:GGML_CUDA_DISABLE_GRAPHS = '1'
+$nsys = 'C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.3.2\target-windows-x64\nsys.exe'
+py .\scripts\gpu_timeline.py capture --nsys $nsys --output D:\AI\traces\prefill35 -- .\build-prefill-cuda\bin\llama-layered-prefill.exe --stream-weights --load-mode none -m D:\AI\Qwen3.5-35B-A3B\Qwen3.5-35B-A3B-Q4_K_M.gguf --device CUDA0 -c 4096 -ub 2048 -b 4096 -n 0 -t 10 -tb 10 -fa on -f D:\prompts\long-input.txt --prompt-tokens 4096 --staging-type f32 --compute-budget-mib 768 --group-budget-mib 1536 --static-budget-mib 256 --transfer-budget-mib 2048 --device-budget-mib 1984 --device-headroom-mib 128
+```
+
+The wrapper adds `--profile-gpu`, disables CPU sampling/context-switch tracing, requests node-level CUDA activity and exports SQLite. Model loading and context creation occur before capture. Only a completed `llama.prefill` NVTX range with its success marker is accepted for analysis. Captures/output files are not overwritten. A missing profiler, unsupported schema, reported CUDA loss, unattributed activities, incomplete range or batched-copy envelope is an error, not a zero-overlap result.
+
+Each output prefix produces:
+
+| Suffix | Purpose |
+| --- | --- |
+| `.nsys-rep` | Native Nsight Systems timeline |
+| `.sqlite` | Original exported activity timestamps |
+| `.trace.json` | Chrome Trace format, with host phases, CUDA streams and aggregate activity/overlap/gap lanes |
+| `.summary.json` | Per-CUDA-device durations, byte counts and overlap ratios |
+| `.capture.log` | Collector and target output |
+
+Analyze an existing capture without running the GPU again:
+
+```powershell
+py .\scripts\gpu_timeline.py analyze D:\AI\traces\prefill35.sqlite --output D:\AI\traces\prefill35-analysis
+py -m pytest .\tests\test_gpu_timeline.py -q
+```
+
+CUDA kernel and memcpy start/end timestamps define GPU activities. Concurrent kernels are merged into a kernel-active union; H2D/D2H intervals are merged separately. Their intersections give the overlap durations. H2D coverage is the intersection duration divided by H2D-active union duration, not the sum of overlapping stream envelopes or CPU API durations. Empty denominators are reported as null. Different GPUs and other processes are not combined. CUDA logical IDs are mapped through process-specific CUDA metadata, not assumed to equal system GPU indices.
+
+`no_traced_gpu_activity_ns` means no kernel/memcpy/memset from the traced process in that interval. It is not whole-machine GPU idle time, SM occupancy, ALU utilization or a measurement of other applications. Run no unrelated GPU work in the target process. Runtime/NVTX ranges describe host submission/setup/waits and are not used as kernel-active intervals.
+
+In a local 35B, 4096-token, microbatch-2048 capture:
+
+| Mode | H2D active seconds | H2D/kernel overlap seconds | H2D coverage | H2D without kernel seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Complete-bank prefetch | 3.681 | 3.118 | 84.708% | 0.563 |
+| Complete-bank, no weight prefetch | 3.674 | 0.105 | 2.863% | 3.569 |
+| Demand, synchronous | 3.388 | 0 | 0% | 3.388 |
+| Demand, asynchronous | 3.408 | 0.000149 | 0.00436% | 3.408 |
+
+The asynchronous-demand scheduling counters therefore did not establish effective physical overlap in this configuration. The timeline exposes that limitation instead of calling the submitted bytes hidden. All four profiled runs retained the unprofiled reference's final logits (NMSE zero).
+
+These captures recorded 22709791476 H2D and 1342185472 D2H bytes for complete loading, versus 20594608884 H2D and 1509878272 D2H for demand loading. The reduced expert traffic is partly offset by routing readback and slot-map updates; host/device traffic savings are not the same percentage as expert-weight savings.
+
+Activity coverage is not a counterfactual critical-path hiding percentage: concurrent transfers can contend with kernels, and transfer intervals without a kernel may overlap CPU preparation. Compare unprofiled end-to-end runs separately, since collection has overhead. Keep raw reports local: Nsight can include command-line/environment metadata. The filtered Chrome Trace output omits that metadata and can be opened in a local viewer; no report is uploaded by this tool.
+
+### Performance analysis and unresolved questions
+
+The following conclusions use the latest default/merge-and-defer captures, not the earlier four-mode capture or unprofiled wall times. They are observations on the T1000, not predictions of another GPU's throughput.
+
+| Activity | Default seconds | Merge and defer seconds |
+| --- | ---: | ---: |
+| Capture window | 34.363 | 36.978 |
+| Kernel-active union | 31.086 | 33.600 |
+| H2D-active union | 3.726 | 3.677 |
+| D2H-active union | 0.205 | 0.207 |
+| H2D/D2H combined union | 3.930 | 3.883 |
+| H2D without a kernel | 0.588 | 0.306 |
+| No traced kernel/copy/memset | 2.369 | 2.735 |
+
+Kernel execution occupies about 90.5%/90.9% of these windows. Matrix multiplication is about 85% of summed kernel duration, and therefore the largest measured target. This does not establish pure arithmetic saturation: memory access, quantized-weight processing, occupancy, scheduling and interference can contribute to kernel duration. The main products remain quantized MMQ; F32 residual staging or an FP16 attention kernel does not mean every matrix product is FP16.
+
+The intervals with no traced GPU activity are not a CPU profile or whole-device idle measurement. CPU packing, graph construction, submission, synchronization and other processes have not been separated. PCIe is not the largest exposed activity in these captures, but it can still contend with kernels. A separate `nvidia-smi` observation reported PCIe Gen3 x8 (x16 maximum); it was not a continuous link/clock trace during these runs.
+
+#### Why did kernel time increase with the experiments?
+
+The merged gate/up calls halve in count but double their output width: they do not halve the model's multiplication count. The isolated product benchmark's gain did not reproduce in the complete capture:
+
+| Kernel category | Default calls / summed seconds | Merge and defer calls / summed seconds | Duration change |
+| --- | ---: | ---: | ---: |
+| Q8 main projections | 500 / 10.506 | 500 / 11.285 | +7.4% |
+| Q4 gate/up | 160 / 10.220 | 80 / 11.280 | +10.4% |
+| Q5 down | 80 / 5.518 | 80 / 5.915 | +7.2% |
+| Flash Attention | 20 / 2.634 | 20 / 2.923 | +11.0% |
+| DeltaNet recurrence | 60 / 0.817 | 60 / 0.819 | +0.3% |
+| MMQ activation quantization | 860 / 0.221 | 780 / 0.178 | -19.5% |
+
+These are sums by selected kernel name, not union-based overlap metrics. Unchanged projections/down/attention also slowed, whereas DeltaNet was almost unchanged. Do not explain everything as extra merged-kernel work, or assert that uniform clock reduction was measured. Moving DMA into compute can introduce shared-memory-system or power-budget competition; run-condition drift and different kernel scheduling are other possibilities. No clock or hardware-metric tables were collected, and the captures do not isolate these causes. Independent merge-only/defer-only activity captures with telemetry would be needed for causal attribution. Both switches stay off by default.
+
+#### When would transfer become the bottleneck?
+
+At unchanged bytes and effective transfer rate, dividing kernel-active time by H2D-active time gives about 8.34x for the default and 9.14x for both switches. Including the H2D/D2H union gives 7.91x/8.65x. Thus roughly 8-9x kernel acceleration would make aggregate communication activity comparable to computation. This is a balance estimate, not a precise threshold: a layer can run out of prefetched data earlier, and producer staging/submission gaps are not included in DMA-active duration.
+
+Do not divide by only the currently exposed 0.306 seconds: most of the presently covered 3.372 seconds can become exposed when compute shrinks. About 22.7 GB of H2D activity at the observed rate alone corresponds to roughly 1100 tokens/s for this 4096-token input, before other costs. Changed PCIe links, cache/residency policies, prompts and copy/compute contention change that estimate. GPU peak FP32 or INT8 TOPS ratios do not establish a prefill speedup.
+
+#### Strata comparison
+
+The code inspection used Strata revision `477ac13cbe8e582c20484871ce459d20d82df09d`, read-only. Its long-chunk path streams all non-resident experts in a known order through an event-protected ring, rather than predicting exact future routes. Expert groups can compute before an entire layer is uploaded. Separate host staging/issuer threads keep CPU copies away from the compute-submission thread; already pinned expert data can DMA directly. It also uses GPU-resident dense weights/selected experts, scratch reuse, larger chunks, dense FP16 GEMMs and format-specific fused Tensor Core expert kernels.
+
+These are design differences to evaluate, not transplanted code or a local performance validation. Strata's `docs/QWEN36.md` reports Qwen3.6-35B-A3B UD-Q4_K_XL on an RTX 3060 12 GB at 2022 tokens/s for pp2048, against 1328 tokens/s for its llama.cpp comparison. That is not the current T1000/Qwen3.5/CPU-resident placement experiment. Its Flash-Next long-prompt and multi-GPU results are different conditions again. No local 3060/3070/3080 run established either a 300-450 tokens/s limit or an 800/2000 tokens/s guarantee.
+
+### Earlier small-microbatch measurements
+
+Measured on Windows with an i9-10900X, 128 GB host RAM and an NVIDIA T1000 4 GB (SM75). Both models use the downloaded Q4_K_M GGUFs. Non-expert weights and hybrid state remain on CPU (`-ngl 0`); routed expert kernels run on CUDA. The input is the same 131-token text, with context 512, logical batch 512, microbatch 8, ten CPU threads and F32 activation staging. Scheduler, expert-group and device-headroom limits are 256 MiB, 1536 MiB and 128 MiB respectively. Complete-bank next-layer prefetch is disabled in these comparisons.
+
+Each configuration ran twice. The table reports the second, warm-cache run, not a statistical average. Wall time excludes model/context creation; initial memory-mapped weight faults can still dominate a cold prefill. Expert residency includes the compact device slot map, but not the rest of the process's GPU allocations. Uploaded GB are decimal expert-weight bytes only.
+
+| Model | Mode | Peak expert MiB | Expert upload GB | Prefill seconds | Tokens/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 35B-A3B | Complete, two-layer groups | 928 | 19.462 | 18.490 | 7.085 |
+| 35B-A3B | Complete, one-layer groups | 464 | 19.462 | 19.156 | 6.838 |
+| 35B-A3B | 64 slots, synchronous | 116.001 | 13.617 | 13.790 | 9.500 |
+| 35B-A3B | 64 slots, pipelined | 116.001 | 13.617 | 15.561 | 8.418 |
+| 122B-A10B | Complete, two-layer groups | 2784 required | Not run | Budget rejection | Not run |
+| 122B-A10B | Complete, one-layer groups | 1392 | 70.062 | 57.899 | 2.263 |
+| 122B-A10B | 64 slots, synchronous | 348.001 | 69.423 | 52.738 | 2.484 |
+| 122B-A10B | 64 slots, pipelined | 348.001 | 69.423 | 54.278 | 2.414 |
+
+All 14 successful runs produced numerically identical final-token F32 logits (248320 values, NMSE zero) relative to their model's complete one-layer reference. Both attempts at 122B two-layer groups were rejected before expert allocation by the explicit group budget; these are not successful GPU runs or measured OOM speedups.
+
+The compact cache reduces expert residency by about 75% relative to complete single-layer banks. On this prompt it reduces 35B expert upload by about 30%, but 122B upload by less than 1%: a small resident set can require substantial eviction and re-upload. Residency savings and transfer savings are separate results.
+
+Pipelining is slower than synchronous demand loading in these local measurements. Pinned staging, stream/event handling and synchronization are not fully hidden by the available shared-expert work. Use `--no-pipeline` for the faster tested T1000 configuration; do not infer that asynchronous submission establishes a speedup. These short-prompt, microbatch-8 results do not establish long-context performance, optimal batch sizes or quality across a prompt corpus.
+
+The final revision passed the four registered CPU prefill tests, 60 Qwen CUDA precision/pipeline/placement combinations, and targeted `CPY,GET_ROWS` checks (258 CPU and 158 CUDA cases). Deliberate token, slot, budget and nonempty-context failures are expected diagnostics.
+
 ## Implementation files
 
 | Surface | Files |
 | --- | --- |
 | Experimental API and execution | `src/llama-ext.h`, `src/llama-context-prefill.cpp`, `src/llama-context.h`, `src/llama-context.cpp` |
 | Cost model and build registration | `src/llama-prefill-plan.h`, `src/llama-prefill-plan.cpp`, `src/CMakeLists.txt` |
-| Grouped model graphs | `src/models/glm5-next.cpp`, `src/llama-graph.h` |
+| Grouped model graphs and compact slot lookup | `src/models/glm5-next.cpp`, `src/models/qwen35moe.cpp`, `src/llama-graph.h`, `src/llama-graph.cpp` |
 | Complete-prefix metadata replay | `src/llama-kv-cache.h`, `src/llama-kv-cache.cpp`, `src/llama-memory-recurrent.h`, `src/llama-memory-recurrent.cpp`, `src/llama-memory-hybrid-idx.h`, `src/llama-memory-hybrid-idx.cpp` |
 | Allocation fix and tests | `ggml/src/ggml-alloc.c`, `tests/test-alloc.cpp`, `tests/test-llama-archs.cpp`, `tests/CMakeLists.txt` |
+| Measurement placement and cross-split cancellation | `ggml/src/ggml-backend.cpp`, `ggml/include/ggml-backend.h` |
 | Runnable example and documentation | `examples/layered-prefill/layered-prefill.cpp`, `docs/development/layered-prefill.md` |
 
 ## Reference

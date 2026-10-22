@@ -71,6 +71,12 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <cuda_profiler_api.h>
+#ifdef GGML_CUDA_NVTX
+#include <nvtx3/nvToolsExt.h>
+#endif
+#endif
 
 #include <algorithm>
 #include <array>
@@ -6042,8 +6048,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static std::atomic<bool> ggml_cuda_profiler_active(false);
+
+static bool ggml_backend_cuda_profiler_start() {
+    bool expected = false;
+    if (!ggml_cuda_profiler_active.compare_exchange_strong(expected, true)) {
+        GGML_LOG_ERROR("CUDA profiler capture is already active in this process\n");
+        return false;
+    }
+    const auto status = cudaProfilerStart();
+    if (status != cudaSuccess) {
+        ggml_cuda_profiler_active = false;
+        GGML_LOG_ERROR("cudaProfilerStart failed: %s\n", cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_backend_cuda_profiler_stop() {
+    if (!ggml_cuda_profiler_active.exchange(false)) {
+        GGML_LOG_ERROR("CUDA profiler capture is not active\n");
+        return false;
+    }
+    const auto status = cudaProfilerStop();
+    if (status != cudaSuccess) {
+        GGML_LOG_ERROR("cudaProfilerStop failed: %s\n", cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+#ifdef GGML_CUDA_NVTX
+static void ggml_backend_cuda_profiler_push(const char * name) { nvtxRangePushA(name); }
+static void ggml_backend_cuda_profiler_pop() { nvtxRangePop(); }
+static void ggml_backend_cuda_profiler_mark(const char * name) { nvtxMarkA(name); }
+#endif
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_profiler_start") == 0) {
+        return (void *)ggml_backend_cuda_profiler_start;
+    }
+    if (strcmp(name, "ggml_backend_profiler_stop") == 0) {
+        return (void *)ggml_backend_cuda_profiler_stop;
+    }
+#ifdef GGML_CUDA_NVTX
+    if (strcmp(name, "ggml_backend_profiler_push") == 0) {
+        return (void *)ggml_backend_cuda_profiler_push;
+    }
+    if (strcmp(name, "ggml_backend_profiler_pop") == 0) {
+        return (void *)ggml_backend_cuda_profiler_pop;
+    }
+    if (strcmp(name, "ggml_backend_profiler_mark") == 0) {
+        return (void *)ggml_backend_cuda_profiler_mark;
+    }
+#endif
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

@@ -2716,6 +2716,12 @@ struct llama_model_qwen35moe : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+        const llama_layer * prefill_weights = nullptr;
+        int prefill_first = 0;
+
+        const llama_layer & layer_for(int il) const {
+            return prefill_weights ? prefill_weights[il - prefill_first] : model.layers[il];
+        }
     };
 
     struct graph_mtp : public llm_graph_context {

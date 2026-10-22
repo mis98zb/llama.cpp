@@ -48,7 +48,7 @@ struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params, bool defer_compute = false);
 
     ~llama_context();
 
@@ -384,6 +384,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool sched_defer_compute = false;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

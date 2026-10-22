@@ -50,6 +50,13 @@ struct llama_layered_prefill_params {
     uint32_t max_group_layers = 4;
     uint32_t max_calibration_ms = 2000; // soft admission limit; one probe may finish after it
     bool reuse_prefix = false; // tokens are only the suffix; reuse the context's complete sequence-0 state
+    uint32_t expert_slots = 0; // zero: complete banks; nonzero: route-driven single-layer cache
+    bool stream_weights = false; // Qwen: pack and temporarily upload all non-expert layer weights
+    size_t max_static_bytes = size_t(256) << 20; // current and prefetched non-expert banks
+    size_t max_device_bytes = 0; // optional state + temporary weights + activation slots + device scheduler cap
+    bool profile_gpu = false; // CUDA profiler capture range and NVTX labels; use an external activity collector
+    bool merge_gate_up = false; // pack compatible streamed gate/up experts for one matrix product
+    bool defer_static_upload = false; // prepare next-layer static weights before compute, submit DMA afterwards
 };
 
 struct llama_layered_prefill_stats {
@@ -89,7 +96,29 @@ struct llama_layered_prefill_stats {
     bool shortfall_is_lower_bound = false;
     size_t budget_shortfall_bytes = 0;
     bool prefix_invalidated = false;
+    uint64_t expert_cache_hits = 0;
+    uint64_t expert_cache_misses = 0;
+    size_t peak_expert_bytes = 0;
+    uint64_t demand_async_bytes = 0;
+    uint32_t demand_overlap_batches = 0;
+    size_t demand_pinned_bytes = 0;
+    uint64_t static_copy_bytes = 0;
+    uint32_t static_layer_loads = 0;
+    uint32_t static_prefetches = 0;
+    uint32_t static_prefetch_skips = 0;
+    size_t peak_static_bytes = 0;
+    double weight_load_ms = 0;
+    double graph_setup_ms = 0;
+    double compute_wait_ms = 0;
+    double activation_copy_ms = 0;
+    uint32_t expert_allocations = 0;
+    uint32_t expert_reuses = 0;
+    size_t peak_device_bytes = 0;
+    uint32_t merged_expert_layers = 0;
 };
+
+// Allocate persistent state and scheduler metadata, without full-model compute buffers.
+LLAMA_API llama_context * llama_init_from_model_layered(llama_model * model, llama_context_params params);
 
 // Returns 0 on success, -1 on unsupported/invalid input, -2 on allocation/compute failure.
 // With reuse_prefix, tokens contain only the consecutive suffix of the live sequence-0 state.

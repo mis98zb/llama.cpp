@@ -835,6 +835,7 @@ struct llm_graph_params {
     const llama_layer * prefill_weights = nullptr;
     ggml_tensor * prefill_input = nullptr;
     ggml_tensor * prefill_output = nullptr;
+    ggml_tensor * prefill_expert_map = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -876,7 +877,8 @@ struct llm_graph_params {
             return false;
         }
         if (prefill_layer != other.prefill_layer || prefill_layers != other.prefill_layers || prefill_type != other.prefill_type ||
-            prefill_weights != other.prefill_weights || prefill_input != other.prefill_input ||
+            prefill_weights != other.prefill_weights || prefill_expert_map != other.prefill_expert_map ||
+            prefill_input != other.prefill_input ||
             prefill_output != other.prefill_output) {
             return false;
         }
@@ -975,6 +977,7 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
     ggml_tensor * t_prefill_in  = nullptr;
     ggml_tensor * t_prefill_out = nullptr;
+    ggml_tensor * t_prefill_ids = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1068,6 +1071,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    ggml_tensor * prefill_expert_map;
+    ggml_tensor * prefill_expert_overlap = nullptr;
 
     const llama_prec_policy * prec_policy;
 
@@ -1427,7 +1432,7 @@ struct llm_graph_context {
     // hybrid
     //
 
-    llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
+    llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool attn = true, bool recurrent = true) const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k(bool attn = true, bool recurrent = true) const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;

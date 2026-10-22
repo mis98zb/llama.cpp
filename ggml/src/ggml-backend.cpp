@@ -1928,7 +1928,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_synchronize(split_backend);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
-                    break;
+                    return GGML_STATUS_ABORTED;
                 }
 
                 j0 = j1;
@@ -2064,8 +2064,7 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(sizes);
 
-    ggml_backend_sched_reset(sched);
-
+    // Keep explicit backend assignments, as in ggml_backend_sched_reserve.
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);

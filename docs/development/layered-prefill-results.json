@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "experiment_dates": ["2026-10-21", "2026-10-22"],
+  "scope": "Local experimental layer-major Qwen3.5 MoE prefill; measurements are not portable GPU performance claims.",
+  "implementation_base_commit": "a2005cf9c29135090bf051661fd7eb3fd66f8ffd",
+  "environment": {
+    "os": "Windows",
+    "cpu": "Intel Core i9-10900X",
+    "host_ram_gib": 128,
+    "gpu": "NVIDIA T1000 4 GB",
+    "cuda_architecture": 75,
+    "cuda_toolkit": "13.4",
+    "cuda_build_msvc": "14.44",
+    "nsight_systems": "2026.3.2",
+    "cpu_threads": 10,
+    "cuda_visible_devices": "2",
+    "logical_cuda_device": 0,
+    "cuda_graphs_disabled": true,
+    "separate_pcie_observation": "Gen3 x8 current, x16 maximum; not time-correlated telemetry for every capture.",
+    "gpu_clocks_and_hardware_counters_recorded": false
+  },
+  "models": {
+    "35b": {
+      "name": "Qwen3.5-35B-A3B",
+      "quantization": "Q4_K_M",
+      "filename": "Qwen3.5-35B-A3B-Q4_K_M.gguf",
+      "download_repository": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "download_revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+      "layers": 40,
+      "routed_experts_per_layer": 256,
+      "top_k": 8,
+      "complete_expert_bank_bytes": 486539264,
+      "context_4096_state_bytes": 149749760
+    },
+    "122b": {
+      "name": "Qwen3.5-122B-A10B",
+      "quantization": "Q4_K_M",
+      "filename": "Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf",
+      "download_repository": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "download_revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "total_shard_bytes": 76536964608,
+      "layers": 48,
+      "routed_experts_per_layer": 256,
+      "top_k": 8,
+      "complete_expert_bank_bytes": 1459617792,
+      "context_4096_state_bytes": 256966656
+    }
+  },
+  "prompt": {
+    "description": "Synthetic technical text, tokenized with special tokens and truncated to exactly 4096 tokens.",
+    "file_bytes": 37538,
+    "sha256": "2ee155f699e8ef578ad4fb97804dc60bf53bfabebaa664fa16fbb2b9ee434cbf",
+    "encoding": "UTF-8 without BOM",
+    "repetitions": 48,
+    "recipe": "Repeat (paragraphs[0] + CRLF + CRLF + paragraphs[1] + CRLF) 48 times, then append one CRLF.",
+    "paragraphs": [
+      "Mixture of experts models route each token to a small set of feed forward networks. During prompt processing, different tokens can select different experts. A useful inference engine must preserve token order for attention and recurrent state, while reusing weights across microbatches.",
+      "Consider a workstation with limited GPU memory and enough CPU memory for all model weights. Explain the difference between transferring every expert in a layer and transferring only missing experts selected by the router. Discuss cache eviction, transfer latency, memory bandwidth, and the impact of batch size. Distinguish lower memory consumption from higher throughput. Describe how to measure correctness and performance without confusing model loading time with prompt evaluation time."
+    ]
+  },
+  "large_prefill_settings": {
+    "prompt_tokens": 4096,
+    "context_tokens": 4096,
+    "logical_batch": 4096,
+    "generated_tokens": 0,
+    "activation_staging": "F32",
+    "flash_attention": true,
+    "stream_weights": true,
+    "load_mode": "none",
+    "model_weights_stay_on_cpu": true,
+    "compute_budget_mib": 768,
+    "group_budget_mib": 1536,
+    "static_budget_mib": 256,
+    "transfer_budget_mib": 2048,
+    "accounted_device_budget_mib": 1984,
+    "device_headroom_mib": 128,
+    "accounting_excludes": ["CUDA driver/context overhead", "backend-private kernel workspaces", "other processes"]
+  },
+  "large_complete_bank_sweeps": [
+    {"model": "35b", "microbatch": 128, "tokens_per_second": 25.287},
+    {"model": "35b", "microbatch": 256, "tokens_per_second": 36.412},
+    {"model": "35b", "microbatch": 512, "tokens_per_second": 57.180},
+    {"model": "35b", "microbatch": 1024, "tokens_per_second": 81.989},
+    {"model": "35b", "microbatch": 2048, "tokens_per_second": 102.201},
+    {"model": "122b", "microbatch": 128, "tokens_per_second": 5.556},
+    {"model": "122b", "microbatch": 256, "tokens_per_second": 9.376},
+    {"model": "122b", "microbatch": 512, "tokens_per_second": 15.242},
+    {"model": "122b", "microbatch": 1024, "status": "device_budget_rejection", "required_bytes": 2138576000},
+    {"model": "122b", "microbatch": 2048, "status": "device_budget_rejection", "required_bytes": 2453156992}
+  ],
+  "sweep_prefetch_admission": {
+    "35b": "Next-layer complete expert prefetch admitted.",
+    "122b": "Requested but not admitted: 0 accepted and 47 skipped expert prefetches; static prefetch also 0 accepted and 47 skipped."
+  },
+  "earlier_35b_microbatch_2048_comparisons": [
+    {"mode": "complete_no_prefetch", "tokens_per_second": 99.059, "final_logits_nmse": 0},
+    {"mode": "demand_sync_256_slots", "tokens_per_second": 100.946, "final_logits_nmse": 0},
+    {"mode": "demand_async_256_slots", "tokens_per_second": 83.588, "final_logits_nmse": 0},
+    {"mode": "complete_prefetch_repeat", "tokens_per_second": 106.685, "final_logits_nmse": 0}
+  ],
+  "expert_and_static_weight_bytes_35b": {
+    "complete_experts": 19461570560,
+    "demand_experts": 17346265088,
+    "static_each_mode": 1585932800,
+    "expert_bytes_saved": 2115305472,
+    "note": "About 10.9% expert-byte savings, not 75%. A 256-slot bank does not have the residency savings of the earlier 64-slot tests."
+  },
+  "earlier_gpu_captures_35b_microbatch_2048": [
+    {"mode": "complete_prefetch", "window_ns": 31157211537, "kernel_active_ns": 27949788758, "h2d_active_ns": 3681207728, "h2d_kernel_overlap_ns": 3118288529, "h2d_bytes": 22709791476, "d2h_bytes": 1342185472},
+    {"mode": "complete_no_prefetch", "window_seconds": 34.8477, "kernel_seconds": 28.4371, "h2d_seconds": 3.67400, "overlap_seconds": 0.105173, "h2d_coverage_percent": 2.86263},
+    {"mode": "demand_sync", "window_seconds": 33.8800, "kernel_seconds": 27.7271, "h2d_seconds": 3.38788, "overlap_seconds": 0, "h2d_coverage_percent": 0},
+    {"mode": "demand_async", "window_seconds": 39.7171, "kernel_seconds": 28.5114, "h2d_seconds": 3.40837, "overlap_seconds": 0.000148546, "h2d_coverage_percent": 0.004358}
+  ],
+  "demand_capture_host_device_bytes": {"h2d": 20594608884, "d2h": 1509878272},
+  "demand_submit_order_diagnostic": {
+    "microbatches": 80,
+    "uploads_completely_finished_before_first_shared_kernel": 79,
+    "layer_1_microbatch_0": {
+      "relative_time_origin": "llama.submit L1 MB0 start",
+      "router_last_kernel_end_ms": 143.8291,
+      "expert_and_map_copy_count": 661,
+      "expert_and_map_bytes": 418120704,
+      "upload_start_ms": 145.481679,
+      "upload_end_ms": 222.978764,
+      "h2d_active_ms": 68.001801,
+      "first_shared_kernel_start_ms": 223.206127,
+      "last_shared_kernel_end_ms": 234.7843
+    },
+    "cause_established": "The route callback packs and submits all missing weights on the host before returning; shared-expert kernels are submitted only afterwards.",
+    "not_established": "Different upload/compute streams do not themselves establish effective overlap. This is not a complete cross-microbatch pipeline."
+  },
+  "complete_prefetch_uncovered_h2d_ms": {
+    "initial_layer_weights": 114.872958,
+    "next_static_weights": 247.141942,
+    "activation_and_other_inputs": 161.871584,
+    "next_expert_prefetch": 39.032715,
+    "total": 562.919199,
+    "next_expert_prefetch_active_ms": 3052.055275,
+    "next_expert_prefetch_coverage_percent": 98.721100652412
+  },
+  "dense_microbenchmark_latest_ms": [
+    {"output": 8192, "input": 2048, "tokens": 2048, "q8_0": 58.06044, "f16": 189.88000, "f32": 52.03205},
+    {"output": 4096, "input": 2048, "tokens": 2048, "q8_0": 28.56192, "f16": 98.27508, "f32": 26.14233},
+    {"output": 2048, "input": 4096, "tokens": 2048, "q8_0": 29.46931, "f16": 105.27867, "f32": 26.17790},
+    {"output": 512, "input": 2048, "tokens": 2048, "q8_0": 4.01719, "f16": 15.73396, "f32": 3.34048},
+    {"output": 2048, "input": 512, "tokens": 2048, "q8_0": 3.88405, "f16": 13.23036, "f32": 3.41304}
+  ],
+  "dense_microbenchmark_caveat": "Expanded-weight products exclude dequantization and extra workspace. Neither F16 nor F32 replaces the default dense MMQ path.",
+  "expert_microbenchmark": {
+    "type": "Q4_K",
+    "experts": 256,
+    "top_k": 8,
+    "tokens": 2048,
+    "input": 2048,
+    "separate_width": 512,
+    "separate_product_ms": 60.77350,
+    "merged_width": 1024,
+    "merged_product_ms": 114.50300,
+    "note": "About 5.8% less time than two separate products, excluding host packing and the rest of the layer."
+  },
+  "optimization_order": "baseline, merge, defer, both, both, defer, merge, baseline; one CPU model, fresh context per point",
+  "optimization_cases": [
+    {"case": 0, "merge": false, "defer": false, "wall_ms": 32933.858, "tokens_per_second": 124.370, "nmse": 0},
+    {"case": 1, "merge": true, "defer": false, "wall_ms": 35683.505, "tokens_per_second": 114.787, "nmse": 0},
+    {"case": 2, "merge": false, "defer": true, "wall_ms": 39545.583, "tokens_per_second": 103.577, "nmse": 0},
+    {"case": 3, "merge": true, "defer": true, "wall_ms": 40567.599, "tokens_per_second": 100.967, "nmse": 0},
+    {"case": 4, "merge": true, "defer": true, "wall_ms": 40837.315, "tokens_per_second": 100.300, "nmse": 0},
+    {"case": 5, "merge": false, "defer": true, "wall_ms": 40862.866, "tokens_per_second": 100.238, "nmse": 0},
+    {"case": 6, "merge": true, "defer": false, "wall_ms": 41178.706, "tokens_per_second": 99.469, "nmse": 0},
+    {"case": 7, "merge": false, "defer": false, "wall_ms": 41235.971, "tokens_per_second": 99.331, "nmse": 0}
+  ],
+  "optimization_invariants": {
+    "expert_copy_bytes": 19461570560,
+    "static_copy_bytes": 1585932800,
+    "peak_accounted_device_bytes": 1708934784,
+    "all_eight_final_logits_nmse": 0,
+    "default_flags_changed": false
+  },
+  "latest_gpu_captures": {
+    "default": {
+      "window_ns": 34363297354,
+      "kernel_active_ns": 31086019327,
+      "h2d_active_ns": 3726438877,
+      "d2h_active_ns": 204539163,
+      "host_transfer_active_ns": 3929682919,
+      "h2d_kernel_overlap_ns": 3138526357,
+      "h2d_without_kernel_ns": 587912520,
+      "h2d_bytes": 22709791476,
+      "d2h_bytes": 1342185472,
+      "no_traced_gpu_activity_ns": 2369149679,
+      "final_logits_nmse": 0
+    },
+    "merge_and_defer": {
+      "window_ns": 36978448411,
+      "kernel_active_ns": 33599637069,
+      "h2d_active_ns": 3677118866,
+      "d2h_active_ns": 206729403,
+      "host_transfer_active_ns": 3882557756,
+      "h2d_kernel_overlap_ns": 3371519463,
+      "h2d_without_kernel_ns": 305599403,
+      "h2d_bytes": 22709791476,
+      "d2h_bytes": 1342185472,
+      "no_traced_gpu_activity_ns": 2734648997,
+      "final_logits_nmse": 0
+    }
+  },
+  "latest_kernel_category_sums_ms": [
+    {"category": "Q8 main projections", "default_count": 500, "default_ms": 10506.247654, "combined_count": 500, "combined_ms": 11285.165829},
+    {"category": "Q4 gate/up", "default_count": 160, "default_ms": 10219.729807, "combined_count": 80, "combined_ms": 11280.238341},
+    {"category": "Q5 down", "default_count": 80, "default_ms": 5518.227401, "combined_count": 80, "combined_ms": 5915.118383},
+    {"category": "Flash Attention", "default_count": 20, "default_ms": 2633.726221, "combined_count": 20, "combined_ms": 2922.734332},
+    {"category": "DeltaNet recurrence", "default_count": 60, "default_ms": 816.717387, "combined_count": 60, "combined_ms": 818.811243},
+    {"category": "MMQ activation quantization", "default_count": 860, "default_ms": 220.578180, "combined_count": 780, "combined_ms": 177.614622}
+  ],
+  "validation": {
+    "cuda_qwen_regression_cases_passed": 96,
+    "cpu_regression_tests_passed": 4,
+    "timeline_pytest_cases_passed": 13,
+    "targeted_cuda_copy_get_rows_checks_passed": 467,
+    "limitations": [
+      "Real-model comparisons cover final-token logits on one synthetic technical prompt, not corpus perplexity or broad quality.",
+      "No new 122B matched demand comparisons completed after the large sweep: private host allocation hit the Windows commit limit.",
+      "The corrected mmap+mlock retry was prepared but not executed; page locking is not claimed to have succeeded.",
+      "No local RTX 3060, 3070 or 3080 throughput was measured.",
+      "No CPU sampling, GPU clock telemetry, SM occupancy or memory-throughput counters were captured.",
+      "Raw Nsight reports, SQLite captures, Chrome traces and full logs remain local because they can contain environment metadata."
+    ]
+  },
+  "conclusions": [
+    "Kernel execution occupies about 90-91% of the latest capture windows; matrix multiplication is about 85% of summed kernel durations.",
+    "The current main matrix path is quantized MMQ, not uniformly FP16.",
+    "H2D coverage is concurrent activity, not a counterfactual critical-path saving or SM utilization.",
+    "Higher coverage was measured, but a material end-to-end speedup was not established; keep both experimental flags off by default.",
+    "Unchanged projections and attention also slowed in the combined capture. Resource contention, run-condition drift and merged-kernel scheduling have not been isolated.",
+    "With transfer bytes/rate fixed, compute and communication activity become comparable after roughly 8-9x kernel acceleration; local dependencies and host staging can limit earlier.",
+    "The approximate 1100 tokens/s H2D-only ceiling uses the current payload and observed activity rate, not a portable GPU upper bound."
+  ]
+}
