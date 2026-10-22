@@ -818,6 +818,12 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                 throw std::runtime_error("route-driven expert cache was not used");
             }
             const bool gpu = !devices.empty() && ggml_backend_dev_type(devices[0]) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            const size_t activation_bytes = tokens.size() * llama_model_n_embd(candidate.first.get()) *
+                (qwen ? 1 : 4) * ggml_type_size(staging);
+            if (stats.activation_host_bytes != activation_bytes ||
+                stats.activation_pinned_bytes != (gpu ? activation_bytes : 0)) {
+                throw std::runtime_error("activations did not use one suffix-sized host buffer");
+            }
             if (stream_weights && gpu && (stats.expert_allocations > 2 || stats.expert_reuses < 2)) {
                 throw std::runtime_error("streamed expert device banks were not reused");
             }
@@ -1200,7 +1206,7 @@ static std::vector<uint8_t> prefix_state(llama_context * ctx) {
     return state;
 }
 
-static int test_prefix_prefill(size_t seed, float stdev, const char * target_backend, ggml_type cache_k) {
+static int test_prefix_prefill(size_t seed, float stdev, const char * target_backend, ggml_type cache_k, bool qwen = false) {
     std::vector<ggml_backend_dev_t> devices;
     if (target_backend) {
         devices.push_back(ggml_backend_dev_by_name(target_backend));
@@ -1209,13 +1215,39 @@ static int test_prefix_prefill(size_t seed, float stdev, const char * target_bac
     const llama_model_tensor_buft_override overrides[] = {
         { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() }, { nullptr, nullptr },
     };
+    const llama_model_tensor_buft_override streamed[] = {
+        { ".*", ggml_backend_cpu_buffer_type() }, { nullptr, nullptr },
+    };
     uint32_t cases = 0;
     for (ggml_type staging : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (uint32_t prefix_tokens : {3u, 33u}) {
-            for (uint32_t group : {1u, 2u, 3u, 0u}) {
-                auto metadata = layered_metadata(true);
+            for (uint32_t group : qwen ? std::vector<uint32_t>{1, 2, 3, 4} : std::vector<uint32_t>{1, 2, 3, 0}) {
+                auto metadata = qwen ? get_gguf_ctx(LLM_ARCH_QWEN35MOE, true) : layered_metadata(true);
+                if (qwen) {
+                    llama_model_saver ms(LLM_ARCH_QWEN35MOE, metadata.get());
+                    ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(4));
+                    ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(16));
+                    ms.add_kv(LLM_KV_EMBEDDING_LENGTH, uint32_t(256));
+                    ms.add_kv(LLM_KV_FEATURES_LENGTH, uint32_t(256));
+                    ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, uint32_t(256));
+                    for (uint32_t il = 0; il < 4; ++il) {
+                        for (const char * part : {"gate", "up", "down"}) {
+                            ggml_tensor tensor = {};
+                            tensor.type = GGML_TYPE_Q4_K;
+                            tensor.ne[0] = tensor.ne[1] = 256;
+                            tensor.ne[2] = 16;
+                            tensor.ne[3] = 1;
+                            ggml_format_name(&tensor, "blk.%u.ffn_%s_exps.weight", il, part);
+                            gguf_add_tensor(metadata.get(), &tensor);
+                        }
+                    }
+                }
+                const bool demand = qwen && group == 4;
+                const bool stream_weights = demand && gpu;
                 auto candidate = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
-                                                    LLAMA_SPLIT_MODE_LAYER, false, overrides, 0, 7, nullptr, nullptr, cache_k);
+                                                    LLAMA_SPLIT_MODE_LAYER, false, stream_weights ? streamed : overrides,
+                                                    0, 7, nullptr, nullptr, cache_k, stream_weights ? INT32_MAX : -1,
+                                                    stream_weights);
                 auto reference = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
                                                     LLAMA_SPLIT_MODE_LAYER, false, gpu ? nullptr : overrides, 0, 7, nullptr, nullptr, cache_k);
                 const auto prefix = get_tokens(prefix_tokens, 128, seed);
@@ -1243,8 +1275,10 @@ static int test_prefix_prefill(size_t seed, float stdev, const char * target_bac
                 params.require_gpu = false;
                 params.reuse_prefix = true;
                 params.pipeline = group != 3;
-                params.group_layers = group ? group : 1;
+                params.group_layers = group && !demand ? group : 1;
                 params.auto_plan = group == 0;
+                params.expert_slots = demand ? 16 : 0;
+                params.stream_weights = stream_weights;
                 params.max_group_expert_bytes = group == 0 ? 300*1024 : 0;
                 params.max_calibration_ms = 0;
                 params.max_compute_bytes = size_t(64) << 20;
@@ -1253,28 +1287,44 @@ static int test_prefix_prefill(size_t seed, float stdev, const char * target_bac
                 params.weight_prefetch = group == 2;
                 params.staging_type = staging;
                 auto * ctx = candidate.second.get();
-                if (group == 0) {
+                if (group == 0 || (qwen && group == 2)) {
                     if (llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0) != saved.size()) {
                         throw std::runtime_error("failed to exercise restored resident prefix");
                     }
                 }
                 const auto before = prefix_state(ctx);
+                params.reuse_prefix = false;
+                if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params) != -1 || prefix_state(ctx) != before) {
+                    throw std::runtime_error("nonempty prefix was accepted without explicit reuse");
+                }
+                params.reuse_prefix = true;
+                const llama_token invalid = 128;
+                if (llama_prefill_layered(ctx, &invalid, 1, params) != -1 || prefix_state(ctx) != before) {
+                    throw std::runtime_error("invalid suffix token changed the prefix");
+                }
                 params.max_host_bytes = 1;
                 if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params) != -2 || prefix_state(ctx) != before) {
                     throw std::runtime_error("admission failure changed the resident prefix");
                 }
-                params.max_host_bytes = size_t(16) << 30;
+                const size_t suffix_bytes = suffix.size() * llama_model_n_embd(candidate.first.get()) *
+                    (qwen ? 1 : 4) * ggml_type_size(staging);
+                params.max_host_bytes = group == 1 ? suffix_bytes : size_t(16) << 30;
                 llama_layered_prefill_stats stats;
                 if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params, &stats)) {
                     throw std::runtime_error("resident prefix suffix prefill failed");
                 }
                 if (stats.reused_prefix_tokens != prefix_tokens || stats.evaluated_tokens != suffix.size() ||
                     stats.calibration_probes != 0 ||
-                    stats.expert_layer_loads != 3 || stats.expert_copy_bytes != 663552 ||
+                    stats.expert_layer_loads != (qwen ? 4u : 3u) ||
+                    (qwen ? stats.expert_copy_bytes == 0 : stats.expert_copy_bytes != 663552) ||
                     stats.microbatches != stats.groups.size() * ((suffix.size() + stats.selected_ubatch - 1) / stats.selected_ubatch) ||
                     llama_memory_seq_pos_max(llama_get_memory(ctx), 0) != (llama_pos) (prefix_tokens + suffix.size() - 1) ||
                     (group == 0 && (!stats.capacity_only || stats.groups.size() < 3))) {
                     throw std::runtime_error("prefix was recomputed or resident capacity planning was not honored");
+                }
+                if (stats.activation_host_bytes != suffix_bytes ||
+                    stats.activation_pinned_bytes != (gpu ? suffix_bytes : 0)) {
+                    throw std::runtime_error("prefix activation storage includes cached tokens or a second full buffer");
                 }
                 if (gpu && group == 2 && stats.weight_prefetches != params.max_prefetch_layers) {
                     throw std::runtime_error("resident prefix did not consume the partial/full next-group prefetch");
@@ -1300,6 +1350,28 @@ static int test_prefix_prefill(size_t seed, float stdev, const char * target_bac
                 if (!std::isfinite(nmse(next, got)) || nmse(next, got) > tolerance) {
                     throw std::runtime_error("decode after resident-prefix prefill differs");
                 }
+                const auto tail = get_tokens(9, 128, seed + 2);
+                rounding = staging == GGML_TYPE_BF16;
+                cp.cb_eval = rounding ? round_prefill_boundary : nullptr;
+                llama_context_ptr tail_reference(llama_init_from_model(reference.first.get(), cp));
+                const auto tail_state = prefix_state(ctx);
+                if (!tail_reference ||
+                    llama_state_seq_set_data(tail_reference.get(), tail_state.data(), tail_state.size(), 0) != tail_state.size()) {
+                    throw std::runtime_error("failed to restore repeated-suffix oracle");
+                }
+                const auto tail_expected = native_suffix(reference.first.get(), tail_reference.get(), tail,
+                    prefix_tokens + suffix.size() + 1);
+                rounding = false;
+                llama_layered_prefill_stats tail_stats;
+                if (llama_prefill_layered(ctx, tail.data(), tail.size(), params, &tail_stats) != 0 ||
+                    tail_stats.reused_prefix_tokens != prefix_tokens + suffix.size() + 1 ||
+                    tail_stats.activation_host_bytes != suffix_bytes / suffix.size() * tail.size()) {
+                    throw std::runtime_error("repeated suffix did not reuse the layered and decoded prefix");
+                }
+                actual.assign(llama_get_logits(ctx), llama_get_logits(ctx) + 128);
+                if (!std::isfinite(nmse(tail_expected, actual)) || nmse(tail_expected, actual) > tolerance) {
+                    throw std::runtime_error("repeated suffix logits differ from native execution");
+                }
                 if (llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0) != saved.size()) {
                     throw std::runtime_error("failed to restore prefix for rejection tests");
                 }
@@ -1322,9 +1394,13 @@ static int test_prefix_prefill(size_t seed, float stdev, const char * target_bac
                         params.prefetch_headroom_bytes = size_t(64) << 20;
                     }
                 }
-                if (group == 1 && prefix_tokens == 3 && staging == GGML_TYPE_F32) {
+                if (((!qwen && group == 1) || demand) && prefix_tokens == 3 && staging == GGML_TYPE_F32) {
                     auto failure = params;
-                    failure.max_expert_bytes = 1;
+                    if (demand) {
+                        failure.expert_slots = 2;
+                    } else {
+                        failure.max_expert_bytes = 1;
+                    }
                     llama_layered_prefill_stats failed;
                     if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), failure, &failed) != -2 ||
                         !failed.prefix_invalidated || llama_memory_seq_pos_max(llama_get_memory(ctx), 0) >= 0) {
@@ -1334,12 +1410,12 @@ static int test_prefix_prefill(size_t seed, float stdev, const char * target_bac
                         throw std::runtime_error("failed to restore the invalidated test prefix");
                     }
                 }
-                auto * hybrid = static_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+                auto * hybrid = static_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
                 hybrid->get_mem_recr()->seq_add(0, 0, -1, 1);
                 if (llama_prefill_layered(ctx, suffix.data(), suffix.size(), params) != -1) {
                     throw std::runtime_error("incomplete recurrent prefix state was accepted");
                 }
-                if (group == 0) {
+                if (group == 0 || demand) {
                     if (llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0) != saved.size()) {
                         throw std::runtime_error("failed to restore prefix for shared-cell rejection");
                     }
@@ -1358,8 +1434,8 @@ static int test_prefix_prefill(size_t seed, float stdev, const char * target_bac
                         throw std::runtime_error("empty attention cache concealed another sequence's recurrent state");
                     }
                 }
-                LOG("resident prefix: staging=%s cache=%s prefix=%u group=%u pipeline=%d, suffix/state/decode/admission OK\n",
-                    ggml_type_name(staging), ggml_type_name(cache_k), prefix_tokens, group, stats.pipeline_active);
+                LOG("resident prefix: model=%s staging=%s cache=%s prefix=%u group=%u pipeline=%d, suffix/state/decode/admission OK\n",
+                    qwen ? "qwen" : "glm", ggml_type_name(staging), ggml_type_name(cache_k), prefix_tokens, group, stats.pipeline_active);
                 ++cases;
             }
         }
@@ -2069,8 +2145,14 @@ int main(int argc, char ** argv) {
         }
         if (layered_prefix) {
             common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
-            const int status = test_prefix_prefill(seed, stdev, target_backend, GGML_TYPE_F16);
-            return status ? status : test_prefix_prefill(seed, stdev, target_backend, GGML_TYPE_Q8_0);
+            for (bool qwen : {false, true}) {
+                for (ggml_type cache : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                    if (test_prefix_prefill(seed, stdev, target_backend, cache, qwen)) {
+                        return 1;
+                    }
+                }
+            }
+            return 0;
         }
         if (layered_planner) {
             common_log_set_verbosity_thold(LOG_LEVEL_ERROR);

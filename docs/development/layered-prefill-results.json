@@ -226,6 +226,99 @@
       "Raw Nsight reports, SQLite captures, Chrome traces and full logs remain local because they can contain environment metadata."
     ]
   },
+  "single_pinned_activation_prefix": {
+    "date": "2026-10-22",
+    "baseline_commit": "de8d7f908",
+    "candidate_revision": "working-tree changes on mis98zb/expert-demand-pipeline",
+    "model": "35b",
+    "environment_reference": "environment",
+    "settings_reference": "large_prefill_settings",
+    "cpu_build_msvc": "14.51.36231",
+    "cuda_build_msvc": "14.44.35207",
+    "microbatch": 2048,
+    "prompt": {
+      "tokens": 4096,
+      "encoding": "UTF-8",
+      "sha256": "74f403ac866dca199e569c5d30b547d414e83919ad43428bbc4c2d180f3b3c58",
+      "repetitions": 160,
+      "text": "Mixture of experts models route each token to selected feed forward networks. Preserve attention history and recurrent state while processing a long prompt. Compare expert weight transfer and activation staging with a fixed batch size. ",
+      "recipe": "Repeat text 160 times without separators, tokenize with the example's default special-token settings, then truncate to 4096 tokens."
+    },
+    "command": [
+      "llama-layered-prefill.exe", "--stream-weights", "--load-mode", "none",
+      "-m", "<35b GGUF>", "--device", "CUDA0", "-c", "4096", "-b", "4096", "-ub", "2048",
+      "-n", "0", "-t", "10", "-tb", "10", "-fa", "on", "-f", "<prompt file>",
+      "--prompt-tokens", "4096", "--staging-type", "f32",
+      "--compute-budget-mib", "768", "--group-budget-mib", "1536", "--static-budget-mib", "256",
+      "--transfer-budget-mib", "2048", "--device-budget-mib", "1984", "--device-headroom-mib", "128",
+      "--logits-file", "<output file>"
+    ],
+    "changes": [
+      "GLM and Qwen accept a complete resident prefix and evaluate only the suffix; Qwen still requires manual planning.",
+      "One full host activation array is overwritten per consumed microbatch; GPU execution requires that array to be pinned.",
+      "Direct activation DMA removes the old activation bounce buffers and host memcpy.",
+      "The complete host array uses max_host_bytes; max_transfer_bytes covers device slots and bounded pinned weight staging.",
+      "A disabled/failed pinned allocation is an explicit GPU error even with synchronous transfers."
+    ],
+    "full_f32_memory_bytes": {
+      "before_pageable_activations": 67108864,
+      "before_pinned_activation_bounce": 67108864,
+      "before_total_host_activations": 134217728,
+      "after_total_host_activations": 33554432,
+      "after_pinned_activations": 33554432,
+      "activation_device_slots_each_version": 67108864,
+      "peak_accounted_device_each_version": 1708934784,
+      "expert_upload_each_version": 19461570560,
+      "activation_h2d_each_version": 1308622848,
+      "activation_d2h_each_version": 1342177280
+    },
+    "early_runs_excluded_from_interleaved_comparison": [
+      {"mode": "before", "wall_ms": 32823.322, "tokens_per_second": 124.789, "note": "Overlapped build/test activity from this session."},
+      {"mode": "after", "wall_ms": 32096.101, "tokens_per_second": 127.617, "note": "Initial candidate check, not the interleaved repeat."}
+    ],
+    "interleaved_f32_runs": [
+      {"order": 1, "mode": "before", "wall_ms": 32192.223, "tokens_per_second": 127.236, "compute_wait_ms": 28968.727},
+      {"order": 2, "mode": "after", "wall_ms": 35380.443, "tokens_per_second": 115.770, "compute_wait_ms": 32722.241},
+      {"order": 3, "mode": "after", "wall_ms": 37830.387, "tokens_per_second": 108.273, "compute_wait_ms": 35233.997},
+      {"order": 4, "mode": "before", "wall_ms": 38392.224, "tokens_per_second": 106.688, "compute_wait_ms": 35762.401}
+    ],
+    "bf16_real_model": {
+      "full": {"tokens": 4096, "wall_ms": 38187.924, "tokens_per_second": 107.259, "host_activation_bytes": 16777216, "pinned_activation_bytes": 16777216},
+      "append": {"reused_prefix_tokens": 2048, "evaluated_tokens": 2048, "wall_ms": 20706.980, "tokens_per_second": 98.904, "host_activation_bytes": 8388608, "pinned_activation_bytes": 8388608},
+      "append_logits_vs_full": {"values": 248320, "byte_identical": true, "nmse": 0}
+    },
+    "f32_real_prefix_check": {
+      "reused_prefix_tokens": 2048,
+      "evaluated_tokens": 2048,
+      "wall_ms": 19459.214,
+      "tokens_per_second": 105.246,
+      "host_activation_bytes": 16777216,
+      "pinned_activation_bytes": 16777216,
+      "logits_vs_full": {"values": 248320, "byte_identical": true, "nmse": 0}
+    },
+    "full_f32_logits_vs_baseline": {"values": 248320, "all_interleaved_runs_byte_identical": true, "nmse": 0},
+    "validation": {
+      "cpu_registered_tests_passed": 5,
+      "prefix_cases_per_seed_per_backend": 64,
+      "cpu_prefix_seeds_passed": [42, 17],
+      "cuda_prefix_seeds_passed": [42, 17],
+      "cuda_qwen_cases_passed": 96,
+      "cuda_grouped_and_joint_planner_passed": true,
+      "msvc_asan_prefix_cases_passed": 64,
+      "msvc_asan_seed": 42,
+      "disabled_pinning_rejected_without_pageable_fallback": true,
+      "prefix_host_budget_equal_to_one_suffix_buffer_passed": true,
+      "repeated_suffix_after_native_decode_passed": true
+    },
+    "limitations": [
+      "Host activation allocations fell from 128 MiB to 32 MiB at this F32 configuration; that is not total process memory.",
+      "Interleaved runs were serial with no concurrent build/test from this session; the shared workstation was not guaranteed exclusive.",
+      "The unchanged baseline itself fell from 127.236 to 106.688 tokens/s. These repetitions do not establish a stable speedup or isolate the source of drift.",
+      "No new profiler trace, clock telemetry, occupancy or hardware bandwidth counters were collected for this change.",
+      "BF16 append/full equality compares the same staging precision, not BF16 quality against unrounded F32.",
+      "No real GLM, 200K/1M context, full-prefix quality corpus or new 122B benchmark was run."
+    ]
+  },
   "conclusions": [
     "Kernel execution occupies about 90-91% of the latest capture windows; matrix multiplication is about 85% of summed kernel durations.",
     "The current main matrix path is quantized MMQ, not uniformly FP16.",

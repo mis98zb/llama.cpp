@@ -82,6 +82,7 @@ public:
 
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+    virtual bool has_complete_prefix(llama_seq_id seq_id) const;
 
 private:
     const llama_hparams & hparams;

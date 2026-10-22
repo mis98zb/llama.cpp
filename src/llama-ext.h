@@ -34,12 +34,12 @@ struct llama_layered_prefill_group {
 struct llama_layered_prefill_params {
     uint32_t n_ubatch = 256;
     ggml_type staging_type = GGML_TYPE_BF16;
-    size_t max_host_bytes = size_t(16) << 30;
+    size_t max_host_bytes = size_t(16) << 30; // one suffix activation buffer and pinned weight staging
     size_t max_expert_bytes = size_t(6) << 30;
     size_t max_compute_bytes = size_t(8) << 30;
     bool require_gpu = true; // false enables CPU correctness testing
     bool pipeline = true;
-    size_t max_transfer_bytes = size_t(512) << 20; // activation device buffers and all pinned staging
+    size_t max_transfer_bytes = size_t(512) << 20; // activation device slots and pinned weight staging; full activations use max_host_bytes
     bool weight_prefetch = true;
     size_t max_prefetch_bytes = size_t(6) << 30; // additional next-layer device weights
     size_t prefetch_headroom_bytes = size_t(512) << 20; // resident-planning and prefetch safety margin
@@ -63,6 +63,8 @@ struct llama_layered_prefill_stats {
     uint64_t expert_copy_bytes = 0;
     uint64_t activation_read_bytes = 0;
     uint64_t activation_write_bytes = 0;
+    size_t activation_host_bytes = 0;
+    size_t activation_pinned_bytes = 0;
     uint32_t expert_layer_loads = 0;
     uint32_t microbatches = 0;
     size_t peak_compute_bytes = 0;

@@ -79,7 +79,8 @@ int main(int argc, char ** argv) {
             pp.defer_static_upload = true;
         } else if (std::strcmp(argv[i], "--compare-optimizations") == 0) {
             compare_optimizations = true;
-        } else if (std::strcmp(argv[i], "--compute-budget-mib") == 0 ||
+        } else if (std::strcmp(argv[i], "--host-budget-mib") == 0 ||
+                   std::strcmp(argv[i], "--compute-budget-mib") == 0 ||
                    std::strcmp(argv[i], "--prefetch-budget-mib") == 0 ||
                    std::strcmp(argv[i], "--prefetch-headroom-mib") == 0 ||
                    std::strcmp(argv[i], "--device-headroom-mib") == 0 ||
@@ -108,7 +109,9 @@ int main(int argc, char ** argv) {
                     throw std::invalid_argument("invalid count");
                 }
                 const size_t bytes = mib ? size_t(value) << 20 : size_t(value);
-                if (std::strcmp(option, "--compute-budget-mib") == 0) {
+                if (std::strcmp(option, "--host-budget-mib") == 0) {
+                    pp.max_host_bytes = bytes;
+                } else if (std::strcmp(option, "--compute-budget-mib") == 0) {
                     pp.max_compute_bytes = bytes;
                 } else if (std::strcmp(option, "--prefetch-budget-mib") == 0) {
                     pp.max_prefetch_bytes = bytes;
@@ -157,6 +160,7 @@ int main(int argc, char ** argv) {
                             [](int, char **) {
                                 LOG("Layered prefill: --staging-type bf16|f32, --no-pipeline, --no-weight-prefetch\n");
                                 LOG("Memory: --compute-budget-mib N, --prefetch-budget-mib N, --prefetch-headroom-mib N\n");
+                                LOG("Host activation and pinned weight staging limit: --host-budget-mib N\n");
                                 LOG("Planner: --auto-plan, --group-layers N, --max-group-layers N, --max-prefetch-layers N\n");
                                 LOG("Planner limits: --group-budget-mib N, --calibration-ms N\n");
                                 LOG("Resident safety margin: --device-headroom-mib N (alias of --prefetch-headroom-mib)\n");
@@ -289,6 +293,8 @@ int main(int argc, char ** argv) {
                         stats.weight_load_ms, stats.graph_setup_ms, stats.compute_wait_ms, stats.activation_copy_ms);
                 LOG_INF("reused prefix=%u tokens, evaluated suffix=%u tokens, capacity-only plan=%d\n",
                         stats.reused_prefix_tokens, stats.evaluated_tokens, stats.capacity_only);
+                LOG_INF("single in-place activation buffer: host bytes=%zu, pinned bytes=%zu\n",
+                        stats.activation_host_bytes, stats.activation_pinned_bytes);
                 LOG_INF("expert layer loads=%u, copied bytes=%" PRIu64 ", activation read/write=%" PRIu64 "/%" PRIu64
                         ", peak measured compute bytes=%zu\n", stats.expert_layer_loads, stats.expert_copy_bytes,
                         stats.activation_read_bytes, stats.activation_write_bytes, stats.peak_compute_bytes);

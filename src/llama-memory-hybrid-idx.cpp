@@ -383,35 +383,22 @@ void llama_memory_hybrid_idx::restore_metadata(const replay_state & state) {
 }
 
 bool llama_memory_hybrid_idx::has_complete_prefix(llama_seq_id seq_id) const {
-    if (!mem_idx || get_mem_attn()->has_pending_updates() || mem_idx->has_pending_updates()) {
+    if (!mem_idx || !llama_memory_hybrid::has_complete_prefix(seq_id) || mem_idx->has_pending_updates()) {
         return false;
     }
     const llama_pos end = get_mem_attn()->seq_pos_max(seq_id);
-    if (end != mem_idx->seq_pos_max(seq_id) || end != get_mem_recr()->seq_pos_max(seq_id)) {
+    if (end != mem_idx->seq_pos_max(seq_id)) {
         return false;
     }
     const auto & attention_cells = get_mem_attn()->get_cells(seq_id);
     const auto & indexer_cells = mem_idx->get_cells(seq_id);
     const auto & attention = attention_cells.seq_pos_get(seq_id);
     const auto & indexer = indexer_cells.seq_pos_get(seq_id);
-    if (attention != indexer || attention.size() != size_t(int64_t(end) + 1) ||
-        attention_cells.get_used() != attention.size() || indexer_cells.get_used() != indexer.size()) {
+    if (attention != indexer || indexer_cells.get_used() != indexer.size()) {
         return false;
     }
-    llama_pos expected = 0;
     for (const auto & cell : attention) {
-        if (cell.first != expected++ || attention_cells.seq_count(cell.second) != 1 ||
-            indexer_cells.seq_count(cell.second) != 1) {
-            return false;
-        }
-    }
-    const auto * recurrent = get_mem_recr();
-    for (size_t i = 0; i < recurrent->cells.size(); ++i) {
-        if (!recurrent->cells[i].is_empty() &&
-            (recurrent->cells[i].seq_id.size() != 1 || !recurrent->cells[i].has_seq_id(seq_id))) {
-            return false;
-        }
-        if (recurrent->cells[i].has_seq_id(seq_id) && recurrent->cells[i].src != (int32_t) i) {
+        if (indexer_cells.seq_count(cell.second) != 1) {
             return false;
         }
     }

@@ -95,7 +95,7 @@ public:
     struct replay_state;
     std::shared_ptr<const replay_state> snapshot_metadata();
     void restore_metadata(const replay_state & state);
-    bool has_complete_prefix(llama_seq_id seq_id) const;
+    bool has_complete_prefix(llama_seq_id seq_id) const override;
     llama_memory_context_ptr init_measure(uint32_t active_tokens, uint32_t new_pools);
 
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools

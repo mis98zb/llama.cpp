@@ -103,13 +103,10 @@ struct prefill_pipeline {
     struct slot {
         ggml_tensor * input = nullptr;
         ggml_tensor * output = nullptr;
-        uint8_t * host_input = nullptr;
-        uint8_t * host_output = nullptr;
         ggml_backend_event_ptr input_ready;
         ggml_backend_event_ptr output_ready;
-        uint8_t * destination = nullptr;
+        bool output_pending = false;
         size_t input_bytes = 0;
-        size_t output_bytes = 0;
     };
 
     ggml_backend_t compute;
@@ -117,7 +114,6 @@ struct prefill_pipeline {
     ggml_backend_ptr download;
     ggml_context_ptr ctx;
     ggml_backend_buffer_ptr device_buffer;
-    ggml_backend_buffer_ptr host_buffer;
     std::array<slot, 2> slots;
 
     static size_t projected_device_bytes(ggml_backend_t backend, const llama_hparams & hp,
@@ -134,7 +130,7 @@ struct prefill_pipeline {
     }
 
     prefill_pipeline(ggml_backend_t backend, const llama_hparams & hp, uint32_t n_tokens,
-                     const llama_layered_prefill_params & params, size_t host_budget,
+                     const llama_layered_prefill_params & params,
                      llama_layered_prefill_stats & stats) : compute(backend) {
         const auto dev = ggml_backend_get_device(backend);
         ggml_backend_dev_props props;
@@ -144,10 +140,9 @@ struct prefill_pipeline {
             throw std::runtime_error("layered prefill pipeline requires asynchronous copies, events and pinned host buffers");
         }
         const size_t row = ggml_row_size(params.staging_type, int64_t(hp.n_embd) * std::max(1u, hp.dsv4_hc_mult));
-        if (n_tokens > host_budget / 4 / row || n_tokens > params.max_transfer_bytes / 8 / row) {
-            throw llama_prefill_resource_error("layered prefill pipeline exceeds its host or transfer buffer budget");
+        if (n_tokens > params.max_transfer_bytes / 4 / row) {
+            throw llama_prefill_resource_error("layered prefill pipeline exceeds its transfer buffer budget");
         }
-        const size_t block = row * n_tokens;
         ctx.reset(ggml_init({4 * ggml_tensor_overhead(), nullptr, true}));
         if (!ctx) {
             throw std::runtime_error("failed to allocate layered prefill pipeline metadata");
@@ -168,23 +163,16 @@ struct prefill_pipeline {
         }
         const auto buft = ggml_backend_get_default_buffer_type(backend);
         const size_t device_bytes = ggml_backend_buft_get_alloc_size_n(buft, tensors, 4);
-        if (prefill_add(device_bytes, 4*block) > params.max_transfer_bytes) {
+        if (device_bytes > params.max_transfer_bytes) {
             throw llama_prefill_resource_error("layered prefill pipeline exceeds max_transfer_bytes");
         }
         device_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
-        host_buffer.reset(ggml_backend_buft_alloc_buffer(host_buft, 4*block));
-        if (!device_buffer || !host_buffer || ggml_backend_buffer_get_type(host_buffer.get()) != host_buft) {
-            throw llama_prefill_resource_error("failed to allocate layered prefill device or pinned staging buffers");
+        if (!device_buffer) {
+            throw llama_prefill_resource_error("failed to allocate layered prefill device slots");
         }
-        const size_t host_bytes = ggml_backend_buffer_get_size(host_buffer.get());
-        const size_t all_bytes = prefill_add(ggml_backend_buffer_get_size(device_buffer.get()), host_bytes);
-        if (host_bytes > host_budget || all_bytes > params.max_transfer_bytes) {
+        const size_t all_bytes = ggml_backend_buffer_get_size(device_buffer.get());
+        if (all_bytes > params.max_transfer_bytes) {
             throw llama_prefill_resource_error("allocated layered prefill pipeline exceeds its budget");
-        }
-        auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(host_buffer.get()));
-        for (size_t i = 0; i < slots.size(); ++i) {
-            slots[i].host_input = base + (2*i)*block;
-            slots[i].host_output = base + (2*i + 1)*block;
         }
         upload.reset(ggml_backend_dev_init(dev, nullptr));
         download.reset(ggml_backend_dev_init(dev, nullptr));
@@ -207,10 +195,9 @@ struct prefill_pipeline {
 
     void finish_output(size_t i) {
         auto & s = slots[i];
-        if (s.destination) {
+        if (s.output_pending) {
             ggml_backend_event_synchronize(s.output_ready.get());
-            std::memcpy(s.destination, s.host_output, s.output_bytes);
-            s.destination = nullptr;
+            s.output_pending = false;
         }
     }
 
@@ -219,8 +206,7 @@ struct prefill_pipeline {
         if (s.input_bytes) {
             ggml_backend_event_synchronize(s.input_ready.get());
         }
-        std::memcpy(s.host_input, source, bytes);
-        ggml_backend_tensor_set_async(upload.get(), s.input, s.host_input, 0, bytes);
+        ggml_backend_tensor_set_async(upload.get(), s.input, source, 0, bytes);
         ggml_backend_event_record(s.input_ready.get(), upload.get());
         s.input_bytes = bytes;
     }
@@ -235,10 +221,9 @@ struct prefill_pipeline {
 
     void copy_output(size_t i, uint8_t * destination, size_t bytes) {
         auto & s = slots[i];
-        ggml_backend_tensor_get_async(download.get(), s.output, s.host_output, 0, bytes);
+        ggml_backend_tensor_get_async(download.get(), s.output, destination, 0, bytes);
         ggml_backend_event_record(s.output_ready.get(), download.get());
-        s.destination = destination;
-        s.output_bytes = bytes;
+        s.output_pending = true;
     }
 
     void drain() {
@@ -1046,10 +1031,10 @@ int llama_context::prefill_layered(
         return -1;
     }
     if ((params.stream_weights && (!qwen || params.group_layers != 1 || params.max_static_bytes == 0)) ||
-        (qwen && (params.auto_plan || params.reuse_prefix)) ||
+        (qwen && params.auto_plan) ||
         (params.expert_slots && (!qwen || params.group_layers != 1 || params.auto_plan ||
                                  params.expert_slots > hp.n_expert || params.expert_slots < hp.n_expert_used()))) {
-        LLAMA_LOG_ERROR("%s: Qwen requires manual planning and an empty prefix; expert slots require single-layer Qwen groups and at least top-k slots\n", __func__);
+        LLAMA_LOG_ERROR("%s: Qwen requires manual planning; expert slots require single-layer Qwen groups and at least top-k slots\n", __func__);
         return -1;
     }
     if (params.stream_weights) {
@@ -1081,16 +1066,12 @@ int llama_context::prefill_layered(
             return -1;
         }
     }
-    auto * hybrid = qwen ? nullptr : static_cast<llama_memory_hybrid_idx *>(memory.get());
-    if (hybrid && !hybrid->has_complete_prefix(0)) {
+    auto * hybrid = static_cast<llama_memory_hybrid *>(memory.get());
+    if (!hybrid->has_complete_prefix(0)) {
         LLAMA_LOG_ERROR("%s: MLA/indexer/recurrent prefix metadata are incomplete, inconsistent, or have pending updates\n", __func__);
         return -1;
     }
     const int64_t prefix = int64_t(memory->seq_pos_max(0)) + 1;
-    if (qwen && prefix != 0) {
-        LLAMA_LOG_ERROR("%s: Qwen layered prefill currently requires an empty context\n", __func__);
-        return -1;
-    }
     if (prefix > 0) {
         if (!params.reuse_prefix) {
             LLAMA_LOG_ERROR("%s: nonempty context requires complete MLA/indexer/KDA/convolution prefix state and reuse_prefix\n", __func__);
@@ -1199,15 +1180,28 @@ int llama_context::prefill_layered_run(
             };
         }
         const size_t row_bytes = ggml_row_size(params.staging_type, (int64_t) hp.n_embd * std::max(1u, hp.dsv4_hc_mult));
-        if ((size_t) n_tokens > params.max_host_bytes / 2 / row_bytes) {
-            throw llama_prefill_resource_error("layered prefill activation buffers exceed max_host_bytes");
+        if ((size_t) n_tokens > params.max_host_bytes / row_bytes) {
+            throw llama_prefill_resource_error("layered prefill activation buffer exceeds max_host_bytes");
         }
         const size_t total_bytes = row_bytes * n_tokens;
-        std::vector<uint8_t> input(total_bytes), output(total_bytes);
+        const auto activation_buft = device == backend_cpu ? ggml_backend_cpu_buffer_type() :
+            ggml_backend_dev_host_buffer_type(ggml_backend_get_device(device));
+        if (!activation_buft) {
+            throw llama_prefill_resource_error("layered prefill requires pinned host activation storage");
+        }
+        ggml_backend_buffer_ptr activation_buffer(ggml_backend_buft_alloc_buffer(activation_buft, total_bytes));
+        if (!activation_buffer || ggml_backend_buffer_get_type(activation_buffer.get()) != activation_buft ||
+            ggml_backend_buffer_get_size(activation_buffer.get()) > params.max_host_bytes) {
+            throw llama_prefill_resource_error("failed to allocate the bounded host activation buffer; GPU execution requires pinned memory");
+        }
+        auto * activations = static_cast<uint8_t *>(ggml_backend_buffer_get_base(activation_buffer.get()));
+        stats.activation_host_bytes = ggml_backend_buffer_get_size(activation_buffer.get());
+        stats.activation_pinned_bytes = device == backend_cpu ? 0 : stats.activation_host_bytes;
+        const size_t host_available = params.max_host_bytes - stats.activation_host_bytes;
         std::unique_ptr<prefill_pipeline> pipeline;
         if (pipelined) {
             pipeline = std::make_unique<prefill_pipeline>(device, hp, std::min<uint32_t>(params.n_ubatch, n_tokens),
-                                                         params, params.max_host_bytes - 2*total_bytes, stats);
+                                                         params, stats);
         }
         std::vector<std::unique_ptr<prefill_weight_prefetch>> next_experts(hp.n_layer());
         std::vector<std::unique_ptr<prefill_static_weights>> next_static(hp.n_layer());
@@ -1316,10 +1310,9 @@ int llama_context::prefill_layered_run(
                     }
                     if (params.stream_weights && !params.expert_slots && device != backend_cpu) {
                         const size_t block = 8 << 20;
-                        const size_t activation_pinned = pipeline ? ggml_backend_buffer_get_size(pipeline->host_buffer.get()) : 0;
                         if (params.max_transfer_bytes < stats.transfer_buffer_bytes ||
                             2 * block > params.max_transfer_bytes - stats.transfer_buffer_bytes ||
-                            2 * block > params.max_host_bytes - 2 * total_bytes - activation_pinned ||
+                            2 * block > host_available ||
                             !ggml_backend_dev_host_buffer_type(ggml_backend_get_device(device))) {
                             throw llama_prefill_resource_error("pinned expert upload exceeds host or transfer budget");
                         }
@@ -1339,11 +1332,10 @@ int llama_context::prefill_layered_run(
                 banks.push_back(std::move(bank));
             }
             if (params.stream_weights) {
-                const size_t activation_pinned = pipeline ? ggml_backend_buffer_get_size(pipeline->host_buffer.get()) : 0;
                 auto current = std::move(next_static[il]);
                 if (!current) {
                     current = std::make_unique<prefill_static_weights>(model.layers[il], device, params.max_static_bytes,
-                        params.max_host_bytes - 2 * total_bytes - activation_pinned,
+                        host_available,
                         params.max_transfer_bytes - stats.transfer_buffer_bytes, false, stats);
                 }
                 current->apply(weights[0]);
@@ -1352,9 +1344,8 @@ int llama_context::prefill_layered_run(
             }
             std::unique_ptr<prefill_demand> demand;
             if (params.expert_slots) {
-                const size_t activation_pinned = pipeline ? ggml_backend_buffer_get_size(pipeline->host_buffer.get()) : 0;
                 demand = std::make_unique<prefill_demand>(*banks[0], model.layers[il], params.expert_slots, il, params,
-                    pipelined, params.max_host_bytes - 2 * total_bytes - activation_pinned, stats);
+                    pipelined, host_available, stats);
             }
             const auto device_usage = [&](size_t workspace) {
                 size_t bytes = stats.resident_state_bytes;
@@ -1395,7 +1386,7 @@ int llama_context::prefill_layered_run(
             size_t offset = 0;
             size_t i_batch = 0;
             if (pipeline && il > 0) {
-                pipeline->prefetch_input(0, input.data(), row_bytes * mctx->get_ubatch().n_tokens);
+                pipeline->prefetch_input(0, activations, row_bytes * mctx->get_ubatch().n_tokens);
             }
             do {
                 const auto & ubatch = mctx->get_ubatch();
@@ -1512,7 +1503,7 @@ int llama_context::prefill_layered_run(
                     if (pipeline) {
                         pipeline->wait_input(slot, bytes);
                     } else {
-                        ggml_backend_tensor_set(res->t_prefill_in, input.data() + offset * row_bytes, 0, bytes);
+                        ggml_backend_tensor_set(res->t_prefill_in, activations + offset * row_bytes, 0, bytes);
                     }
                     stats.activation_read_bytes += bytes;
                     if (probe) {
@@ -1522,7 +1513,6 @@ int llama_context::prefill_layered_run(
                 }
                 if (i_batch == 0 && params.weight_prefetch &&
                     !demand && device != backend_cpu && i_group + 1 < groups.size()) {
-                    const size_t pinned_bytes = pipeline ? ggml_backend_buffer_get_size(pipeline->host_buffer.get()) : 0;
                     size_t extra_bytes = 0, extra_pinned = 0;
                     for (uint32_t p = 0; p < group.n_prefetch_layers; ++p) {
                         auto limits = params;
@@ -1542,7 +1532,7 @@ int llama_context::prefill_layered_run(
                             limits.max_prefetch_bytes = std::min(limits.max_prefetch_bytes, available);
                         }
                         next_experts[last + p] = prefill_try_prefetch(model.layers[last + p], device, sched.get(), limits,
-                            params.max_host_bytes - 2*total_bytes - pinned_bytes - extra_pinned,
+                            host_available - extra_pinned,
                             params.max_transfer_bytes > stats.transfer_buffer_bytes + extra_pinned ?
                                 params.max_transfer_bytes - stats.transfer_buffer_bytes - extra_pinned : 0,
                             probe && probe->prefetch_steps ? probe->prefetch_steps :
@@ -1565,7 +1555,6 @@ int llama_context::prefill_layered_run(
                     const size_t allocated = ggml_backend_sched_get_buffer_size(sched.get(), device);
                     const size_t growth = params.max_compute_bytes > allocated ? params.max_compute_bytes - allocated : 0;
                     const size_t current = static_banks[0]->size();
-                    const size_t activation_pinned = pipeline ? ggml_backend_buffer_get_size(pipeline->host_buffer.get()) : 0;
                     size_t expert_pinned = 0;
                     for (uint32_t lid = last; lid < hp.n_layer(); ++lid) {
                         if (next_experts[lid]) {
@@ -1574,7 +1563,9 @@ int llama_context::prefill_layered_run(
                         }
                     }
                     const size_t transfer_used = prefill_add(stats.transfer_buffer_bytes, expert_pinned);
-                    const size_t host_used = prefill_add(2 * total_bytes + activation_pinned, expert_pinned);
+                    const size_t demand_pinned = demand && demand->pinned ?
+                        ggml_backend_buffer_get_size(demand->pinned.get()) : 0;
+                    const size_t host_used = prefill_add(stats.activation_host_bytes, prefill_add(expert_pinned, demand_pinned));
                     const bool fits = current <= params.max_static_bytes && bytes <= params.max_static_bytes - current &&
                         bytes <= free_bytes && params.prefetch_headroom_bytes <= free_bytes - bytes &&
                         growth <= free_bytes - bytes - params.prefetch_headroom_bytes &&
@@ -1613,7 +1604,7 @@ int llama_context::prefill_layered_run(
                 const size_t next = offset + ubatch.n_tokens;
                 if (pipeline && il > 0 && next < (size_t) n_tokens && status == GGML_STATUS_SUCCESS) {
                     const size_t next_bytes = row_bytes * std::min<size_t>(params.n_ubatch, n_tokens - next);
-                    pipeline->prefetch_input((i_batch + 1) % 2, input.data() + next * row_bytes, next_bytes);
+                    pipeline->prefetch_input((i_batch + 1) % 2, activations + next * row_bytes, next_bytes);
                     ++stats.input_prefetches;
                 }
                 if (status == GGML_STATUS_SUCCESS && last < hp.n_layer() &&
@@ -1644,10 +1635,11 @@ int llama_context::prefill_layered_run(
                         (prepare_end - prepare_start + inputs_end - inputs_start) * 1e-3});
                 }
                 if (pipeline) {
-                    pipeline->copy_output(slot, output.data() + offset * row_bytes, bytes);
+                    // Compute has consumed this slice; the next input upload uses a disjoint slice.
+                    pipeline->copy_output(slot, activations + offset * row_bytes, bytes);
                     ++stats.async_output_batches;
                 } else {
-                    ggml_backend_tensor_get(res->t_prefill_out, output.data() + offset * row_bytes, 0, bytes);
+                    ggml_backend_tensor_get(res->t_prefill_out, activations + offset * row_bytes, 0, bytes);
                 }
                 stats.activation_write_bytes += bytes;
                 if (probe) {
@@ -1674,7 +1666,6 @@ int llama_context::prefill_layered_run(
                     res->reset();
                 }
             }
-            input.swap(output);
             if (params.stream_weights && device != backend_cpu) {
                 spare_experts = std::move(banks[0]);
             }
@@ -1789,18 +1780,18 @@ int llama_context::prefill_layered_plan(
         }
         const size_t row = ggml_row_size(params.staging_type, int64_t(hp.n_embd) * hp.dsv4_hc_mult);
         LLAMA_LOG_DEBUG("%s: begin planning\n", __func__);
-        if ((size_t) n_tokens > SIZE_MAX / 2 / row) {
+        if ((size_t) n_tokens > SIZE_MAX / row) {
             diagnostic.budget_shortfall_bytes = SIZE_MAX - params.max_host_bytes;
             diagnostic.shortfall_is_lower_bound = true;
             throw llama_prefill_resource_error("resident host staging exceeds the addressable size");
         }
-        if ((size_t) n_tokens > params.max_host_bytes / 2 / row) {
-            const size_t required = 2 * row * n_tokens;
+        if ((size_t) n_tokens > params.max_host_bytes / row) {
+            const size_t required = row * n_tokens;
             diagnostic.budget_shortfall_bytes = required - params.max_host_bytes;
             throw llama_prefill_resource_error(format("resident host staging needs %zu bytes, limit %zu, gap %zu",
                 required, params.max_host_bytes, diagnostic.budget_shortfall_bytes));
         }
-        const size_t activation_bytes = 2 * row * n_tokens;
+        const size_t activation_bytes = row * n_tokens;
         std::vector<uint32_t> families;
         std::vector<size_t> allocation, payload;
         std::array<bool, 8> seen = {};
@@ -2004,11 +1995,8 @@ int llama_context::prefill_layered_plan(
                 result.group.dispatch_ms = (ggml_time_us() - start) * 1e-3;
                 ggml_backend_sched_reset(sched.get());
                 const size_t transfer_device = transfer_device_bytes(b);
-                const size_t transfer_host = pipelined ? 4 * row * b : 0;
-                const size_t transfer_all = prefill_add(transfer_device, transfer_host);
                 result.fits = result.group.compute_bytes <= params.max_compute_bytes &&
-                    transfer_all <= params.max_transfer_bytes &&
-                    transfer_host <= params.max_host_bytes - activation_bytes &&
+                    transfer_device <= params.max_transfer_bytes &&
                     weight_bytes <= device_budget &&
                     result.group.device_compute_bytes <= device_budget - weight_bytes &&
                     transfer_device <= device_budget - weight_bytes - result.group.device_compute_bytes;
@@ -2088,13 +2076,12 @@ int llama_context::prefill_layered_plan(
                             extra = prefill_add(extra, allocation[il]);
                             pinned = prefill_add(pinned, 2 * std::min<size_t>(8 << 20, payload[il]));
                             const size_t transfer_device = transfer_device_bytes(b);
-                            const size_t transfer_host = pipelined ? 4 * row * b : 0;
                             const size_t current = prefill_add(plan.groups[g].expert_bytes,
                                                               prefill_add(device_compute, transfer_device));
                             if (extra > params.max_prefetch_bytes || current > device_budget ||
                                 extra > device_budget - current ||
-                                pinned > params.max_transfer_bytes - transfer_device - transfer_host ||
-                                pinned > params.max_host_bytes - activation_bytes - transfer_host) {
+                                pinned > params.max_transfer_bytes - transfer_device ||
+                                pinned > params.max_host_bytes - activation_bytes) {
                                 break;
                             }
                             auto trial = plan;

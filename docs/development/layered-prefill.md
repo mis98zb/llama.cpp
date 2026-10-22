@@ -11,9 +11,9 @@ The path is explicit opt-in. Default decode remains unchanged. It accepts sequen
 ## Execution
 
 1. Validate the input, cache endpoints and configured resource limits. Automatic planning preflights every selected group before updating model state.
-2. Allocate two bounded host activation buffers.
+2. Allocate one bounded host activation buffer for this call's tokens only. GPU execution requires the complete buffer to be pinned; CPU correctness tests use ordinary host memory.
 3. For each group, make its complete routed expert tensors device-resident, build a multi-layer graph and process every microbatch in position order.
-4. Keep internal group activations on the device. Read and write the complete mHC residual only at group boundaries: `[hidden_size, 4, suffix_tokens]`. Never collapse the streams before the output head.
+4. Keep internal group activations on the device. At group boundaries, read each microbatch's input slice and overwrite the same host slice with its output after compute finishes. GLM preserves `[hidden_size, 4, suffix_tokens]`; Qwen preserves `[hidden_size, suffix_tokens]`. Never collapse GLM's streams before the output head.
 5. Preserve every layer's final MLA, indexer, convolution and recurrent state for subsequent ordinary decode.
 6. Run the output head for the final token and expose the usual logits.
 
@@ -31,13 +31,13 @@ For BF16 staging, internal group boundaries still round to BF16 and convert back
 
 BF16 staging is not lossless. In particular, rounding can change the DSA top-k selection. An exploratory sparse miniature model with seed 17 produced final-logit NMSE about `8.9e-3` relative to unrounded F32. This is not a real-model quality measurement, but it rules out claiming that BF16 staging always preserves the original logits closely. Evaluate BF16 on representative real prompts before using it for quality-sensitive work; select F32 staging to isolate scheduling correctness.
 
-For hidden size 4096, four streams and microbatch 256, one BF16 boundary block is 8 MiB in each direction. At 200000 tokens, two complete BF16 activation buffers require about 12.2 GiB of host RAM, excluding all other allocations.
+For hidden size 4096, four streams and microbatch 256, one BF16 boundary block is 8 MiB in each direction. At 200000 newly evaluated tokens, the single complete BF16 activation buffer requires about 6.1 GiB of host RAM. One million newly evaluated tokens require about 30.5 GiB. These sizes exclude all other allocations and do not depend on microbatch size. An already cached prefix does not contribute activation rows.
 
 The routed experts of one layer contain `3 * 4096 * 2048 * 288` parameters. If all three tensors use Q4_K, their storage is about 3.80 GiB. Mixed GGUF quantization can require more. Check actual tensor sizes and backend operator support, not the file's Q4 label.
 
 The complete working set includes current-layer weights, persistent device caches, activation buffers, masks, operator workspace, backend overhead and safety headroom. Do not double-count allocations already reflected in device free memory.
 
-The experimental API separately limits the two host activation buffers, the current expert buffer including backend padding, and the sum of scheduler compute buffers. The last limit is not a total-VRAM limit: persistent model/context allocations and backend-private kernel workspaces remain additional costs. Backend allocation failures are errors, not fallbacks.
+The experimental API separately limits the single host activation buffer plus pinned weight staging, the current expert buffer including backend padding, and the sum of scheduler compute buffers. The last limit is not a total-VRAM limit: persistent model/context allocations and backend-private kernel workspaces remain additional costs. Backend allocation failures are errors, not fallbacks. Locking the full activation buffer removes staging copies but makes that physical RAM unavailable for paging; keep the host limit below what the machine can safely pin.
 
 Start evaluation at microbatch 256, compare 512, and consider 1024 only after measuring real graphs. These are candidates, not verified capacity limits. Manual execution uses `n_ubatch` and `group_layers`; `auto_plan` searches smaller batches and variable-length groups. The selected batch size remains fixed for the entire request, so metadata replay never silently changes chunk boundaries. Actual graphs are measured again before allocation and must stay within their admitted workspace bound.
 
@@ -89,7 +89,7 @@ The standalone CUDA example loaded a locally generated tiny GGUF and completed b
 
 `llama_prefill_layered` in `src/llama-ext.h` accepts a complete initial tokenized prompt, or only new tokens when `reuse_prefix = true`, and returns the final token's logits through the ordinary logits getters. A suffix starts at the live sequence-0 endpoint plus one. A subsequent ordinary decode starts at prefix length plus suffix length. Unsupported configurations return `-1`; resource and execution failures return `-2`, with explicit diagnostics.
 
-The defaults are BF16 staging, microbatch 256, 16 GiB of host activation storage including pinned staging, 6 GiB of current-layer expert storage, and 8 GiB of scheduler compute buffers. The 512 MiB transfer budget covers activation device buffers and all pinned staging, including optional weight-prefetch bounce buffers. C++ callers can set these limits through `llama_layered_prefill_params`. CPU execution requires `require_gpu = false` and is intended for correctness testing. Only one GPU is supported.
+The defaults are BF16 staging, microbatch 256, 16 GiB of host activation storage including pinned weight staging, 6 GiB of current-layer expert storage, and 8 GiB of scheduler compute buffers. `--host-budget-mib` sets the host limit. The 512 MiB transfer budget covers activation device slots and pinned weight staging, including optional weight-prefetch bounce buffers. The complete pinned activation buffer counts against the host limit, not the microbatch transfer limit. C++ callers can set these limits through `llama_layered_prefill_params`. CPU execution requires `require_gpu = false` and is intended for correctness testing. Only one GPU is supported.
 
 The separate `llama-layered-prefill` example uses the shared llama.cpp argument parser, keeps routed experts in plain CPU buffers, invokes the new path, reports copy statistics and then performs greedy ordinary decode. `--staging-type f32` selects the unrounded reference; the default is `bf16`. It raises the logical batch capacity to hold the complete prompt; `-ub` remains the physical microbatch bound. It does not enable the feature in the normal CLI or server.
 
@@ -103,21 +103,21 @@ For a fixed two-layer group, add `--group-layers 2`. For joint automatic plannin
 
 ## Microbatch activation pipeline
 
-On an asynchronous GPU backend with events and pinned host buffers, `pipeline = true` (the default) uses two input slots and two output slots. The complete layer activations stay in pageable system memory; only the bounded bounce buffers are pinned. Failure to obtain real pinned storage is an error, not a silent pageable substitute. `--no-pipeline` selects the synchronous reference in the example.
+On an asynchronous GPU backend with events and pinned host buffers, `pipeline = true` (the default) uses two device input slots and two device output slots. One complete host activation buffer is pinned and updated in place. DMA reads and writes its microbatch slices directly, with no activation bounce buffers or host `memcpy`. Failure to obtain real pinned storage is an error, not a silent pageable substitute. `--no-pipeline` selects synchronous transfers but still uses one complete pinned buffer on a GPU.
 
 Each slot owns persistent device storage outside the scheduler's graph buffers. A graph reads its input slot and writes its output slot directly, so resetting the graph cannot invalidate an in-flight activation copy.
 
 - Upload and download use separate backend streams from compute.
 - Before compute consumes an input slot, its stream waits for that slot's upload event.
 - Once a microbatch has been submitted, the host queues the next microbatch's input upload before waiting for current compute.
-- After compute completes, the output slot is copied asynchronously to pinned host memory. It can remain in flight during the next microbatch's compute.
-- A slot is not reused until its previous transfer completes. At layer boundaries, all copies are drained before swapping host activation buffers.
+- After compute completes on all participating backends, the output slot is copied asynchronously over the same host slice that supplied its input. That slice's upload has already completed; the next input upload reads a disjoint slice.
+- A device output slot is not reused until its previous download completes. At group boundaries, all transfers are drained before the next group reads the overwritten host buffer. Error cleanup also drains the streams before releasing host storage.
 
 KDA computation remains sequential in token order. This pipelines transfers, not independent execution of causally dependent microbatches. Compute is still synchronized before graph reset; graph reuse and concurrent graph execution are not implemented.
 
-For hidden size 4096, four streams, BF16 staging and microbatch 256, the device slots occupy 32 MiB and the pinned slots another 32 MiB, before backend padding. Both are charged to `max_transfer_bytes`; pinned bytes also count against `max_host_bytes`. Scheduler compute buffers, experts and persistent state are additional allocations.
+For hidden size 4096, four streams, BF16 staging and microbatch 256, the device slots occupy 32 MiB before backend padding, charged to `max_transfer_bytes`. There is no additional 32 MiB of pinned activation slots. The full pinned buffer is charged once to `max_host_bytes`. Scheduler compute buffers, experts and persistent state are additional allocations.
 
-Statistics report active pipelining, allocated transfer bytes, next-input prefetches and asynchronous output batches. Tests require these counts to cover every eligible microbatch, not merely numerical parity. They also cover insufficient transfer budgets and retry after failure. These counters establish that the asynchronous path executed, not a hardware-overlap percentage or an end-to-end speedup.
+Statistics report `activation_host_bytes`, `activation_pinned_bytes`, active pipelining, allocated device-slot/weight-staging transfer bytes, next-input prefetches and asynchronous output batches. Tests require exactly one suffix-sized activation allocation, no activation rows for the prefix, and transfer counts covering every eligible microbatch. They also cover a host budget that fits only one full buffer, insufficient transfer budgets and retry after failure. These counters establish that the asynchronous path executed, not a hardware-overlap percentage or an end-to-end speedup.
 
 ## Conditional next-layer expert prefetch
 
@@ -151,7 +151,7 @@ Statistics distinguish accepted prefetches, skips, device-allocation attempts, p
 
 GPU tests additionally cover a permitted prefetch, insufficient extra-bank budget, and an impossible free-memory headroom requirement. The skip cases require zero device-allocation attempts. They compare logits and subsequent decode, preserve once-per-layer expert byte counts, and retry after resource errors. Allowed prefetch is tested both with and without activation pipelining.
 
-Local validation passed 48 CUDA cases for each of seeds 42 and 17 on the T1000, along with the registered CPU test and the three existing hybrid architecture checks. The standalone synthetic-GGUF example reported one accepted prefetch and 589824 prefetched bytes when given an appropriate small-model compute budget. With the extra-bank budget set to zero it reported one skip and zero allocation attempts. With pinned memory disabled and the activation pipeline explicitly off, it also skipped weight prefetch and completed normal layered execution and decode. These remain synthetic checks, not real GLM/200K capacity or speed measurements.
+Before the full pinned activation change, local validation passed 48 CUDA cases for each of seeds 42 and 17 on the T1000, along with the registered CPU test and the three existing hybrid architecture checks. The standalone synthetic-GGUF example reported one accepted prefetch and 589824 prefetched bytes when given an appropriate small-model compute budget. With the extra-bank budget set to zero it reported one skip and zero allocation attempts. That version also allowed synchronous pageable activations when pinning was disabled. The current GPU path instead requires full pinned activation storage even with `--no-pipeline`; pinning failure is an explicit error. These remain synthetic checks, not real GLM/200K capacity or speed measurements.
 
 ## Joint batch/group/prefetch planning
 
@@ -177,9 +177,9 @@ This is an example of configuration, not a verified real-model capacity or speed
 
 ## Resident prefix reuse
 
-The caller must provide a context containing the complete state at the desired prefix endpoint. A successful native decode, successful layered prefill, or compatible full state restore can establish it. Set `reuse_prefix = true` and pass only the new tokens. The API appends positions; it does not find matching historical prompts, truncate KDA history, or reconstruct state from a token string.
+Both GLM5-Next and Qwen3.5 MoE support resident prefix reuse. The caller must provide a context containing the complete state at the desired prefix endpoint. A successful native decode, successful layered prefill, or compatible full state restore can establish it. Set `reuse_prefix = true` and pass only the new tokens. The API appends positions; it does not find matching historical prompts, truncate recurrent history, or reconstruct state from a token string. Native llama.cpp already supports appending to a live context; these checks apply to this separate layer-major execution order and do not change native decode or the server's prompt cache.
 
-Validation requires contiguous sequence-0 positions, matching MLA/indexer/recurrent endpoints, matching attention/indexer cell maps, ready recurrent sources, no pending stream/shift updates, and no shared or other active sequence cells. The caller remains responsible for model/settings/token provenance. Shape/position validation cannot prove that arbitrary externally modified tensors contain the correct state.
+Shared validation requires contiguous sequence-0 attention positions, matching attention/recurrent endpoints, ready recurrent sources, no pending stream/shift updates, and no shared or other active sequence cells. GLM additionally requires matching indexer endpoints and attention/indexer cell maps. The caller remains responsible for model/settings/token provenance. Shape/position validation cannot prove that arbitrary externally modified tensors contain the correct state.
 
 All persistent tensor buffers remain at their existing configured locations. Prefix replay copies host metadata only; it does not save prefix KV/state tensors to CPU or disk. It preserves incomplete k-pool tails, stale markers, cached keys/gates/pooled rows, KDA matrices and convolution windows. Full-state restoration can legitimately require re-pooling stale cached indexer entries, just as the native path does; prefix transformer layers are not recomputed.
 
@@ -211,11 +211,11 @@ ctest --test-dir build-prefill -R "^(test-alloc|test-layered-prefill|test-layere
 
 Grouped tests compare one-, two-, three- and four-layer execution, including tail batches and F32/BF16 staging. Joint-plan tests verify actual execution at the selected batch size, CPU F32 serialized state, subsequent decode, context-local profile reuse, group budgets and non-destructive timing-profile reuse for a live prefix.
 
-Resident-prefix tests cover native and restored prefixes of 3 and 33 tokens, 19-token suffixes, incomplete pool boundaries, partial next-group prefetch, activation pipeline on/off, F16 and matched Q8_0 K/V caches, and both staging types. They compare final logits, full CPU F32 state and subsequent native decode. They reject inconsistent recurrent state, shared cells and orphaned recurrent state behind an empty attention cache, preserve prefixes on admission/capacity failures, and explicitly test invalidation after partial execution.
+Resident-prefix tests cover both architectures, native and restored prefixes of 3 and 33 tokens, 19-token suffixes followed by native decode and another 9-token suffix, incomplete GLM pool boundaries, partial next-group prefetch, activation pipeline on/off, F16 and matched Q8_0 K/V caches, and both staging types. Qwen covers complete banks, grouped execution and a route-driven bank with streamed non-expert weights on CUDA. Tests compare final logits, full CPU F32 state and subsequent native decode. They reject inconsistent recurrent state, shared cells and orphaned recurrent state behind an empty attention cache, preserve prefixes on admission/capacity failures, and explicitly test invalidation after partial execution.
 
 Planning exposed a size-only allocator reservation bug: an allocation plan could exist without backing buffers on a fresh scheduler. The allocator now requests reallocation in that case. `test-alloc` includes fresh and growing size-only reservation regressions, and CPU/CUDA planner tests exercise real scheduler allocation after measurement.
 
-The final local runs passed the four registered CPU tests above, 48 single-layer/prefetch CUDA cases, 36 grouped CUDA cases, calibrated joint-planner tests with seeds 42 and 17, and all 32 resident-prefix combinations for each seed on the T1000. The existing CUDA `glm5-next`, `qwen4exp` and `kimi-linear` architecture checks also passed. Error logs from deliberate budget/state rejection cases are expected; all test processes exited successfully.
+The earlier GLM-only revision passed the four registered CPU tests above, 48 single-layer/prefetch CUDA cases, 36 grouped CUDA cases, calibrated joint-planner tests with seeds 42 and 17, and all 32 resident-prefix combinations for each seed on the T1000. The existing CUDA `glm5-next`, `qwen4exp` and `kimi-linear` architecture checks also passed. Error logs from deliberate budget/state rejection cases are expected; all test processes exited successfully.
 
 An MSVC AddressSanitizer build using `/fsanitize=address` and `/EHsc` passed these targeted CPU commands:
 
@@ -236,7 +236,7 @@ These are synthetic correctness/resource-policy checks on the local CPU and SM75
 
 ## Qwen3.5 MoE route-driven prefill
 
-Qwen3.5 MoE supports manual layer groups and an initially empty, single-sequence text context. Its group boundaries contain `[hidden_size, suffix_tokens]` activations, not GLM's four mHC streams. Each group replays the attention and recurrent allocation metadata without copying or rolling back cache tensors. Layers consume microbatches in position order. Ordinary decode can continue from the resulting KV, convolution and DeltaNet state. Automatic planning and resident-prefix reuse remain GLM-only; Qwen requests for either are rejected explicitly.
+Qwen3.5 MoE supports manual layer groups and a single-sequence text context, initially empty or extended with `reuse_prefix`. Its group boundaries contain `[hidden_size, suffix_tokens]` activations, not GLM's four mHC streams. Each group replays the attention and recurrent allocation metadata without copying or rolling back cache tensors. Layers consume microbatches in position order. Ordinary decode can continue from the resulting KV, convolution and DeltaNet state. Automatic planning remains GLM-only; Qwen requests for it are rejected explicitly. Prefix reuse works with complete banks, the route-driven bank and `--stream-weights`; it does not require future-route prediction.
 
 With `--expert-slots 0` (the default), complete routed expert banks are uploaded once per layer. This reference supports multiple-layer groups and optional complete-bank next-group prefetch. Both merged gate/up and separate gate/up tensors are supported. Non-expert weight placement still follows ordinary model offload settings.
 
@@ -472,7 +472,50 @@ The compact cache reduces expert residency by about 75% relative to complete sin
 
 Pipelining is slower than synchronous demand loading in these local measurements. Pinned staging, stream/event handling and synchronization are not fully hidden by the available shared-expert work. Use `--no-pipeline` for the faster tested T1000 configuration; do not infer that asynchronous submission establishes a speedup. These short-prompt, microbatch-8 results do not establish long-context performance, optimal batch sizes or quality across a prompt corpus.
 
-The final revision passed the four registered CPU prefill tests, 60 Qwen CUDA precision/pipeline/placement combinations, and targeted `CPY,GET_ROWS` checks (258 CPU and 158 CUDA cases). Deliberate token, slot, budget and nonempty-context failures are expected diagnostics.
+The earlier small-microbatch revision passed the four registered CPU prefill tests, 60 Qwen CUDA precision/pipeline/placement combinations, and targeted `CPY,GET_ROWS` checks (258 CPU and 158 CUDA cases). Deliberate token, slot, budget and nonempty-context failures are expected diagnostics.
+
+## Single pinned activation buffer and Qwen prefix reuse (2026-10-22)
+
+The current path keeps one full activation array for the evaluated suffix, not one array per layer and not an array for the configured context capacity. GPU calls allocate that array through the backend's pinned host buffer type and reject a pageable fallback. CPU correctness calls use the same single-array lifetime without page locking. The array is released after all transfers complete at the end of the call; KV, indexer, convolution and recurrent state remain in the context.
+
+In-place overwrite does not depend on approximate routing or reduced precision. Each graph reads a microbatch into separate device storage before computing. Its output can overwrite the same host slice only after compute synchronization, which also completes the input upload dependency. The prefetched next microbatch occupies a disjoint slice. Two device output slots retain their completion events, and every download is drained before the next group starts. This removes both complete-array ping-pong and activation bounce-buffer copies without changing expert uploads or the requested microbatch.
+
+Prefix validation is shared by the ordinary hybrid memory used by Qwen and the indexed hybrid memory used by GLM. GLM adds its indexer checks on top. Both preserve a valid prefix when admission fails, reject incomplete or shared state, and report invalidation if execution fails after updating recurrent state. This is live-state suffix reuse, not automatic token-prefix matching or arbitrary recurrent rollback. Qwen automatic planning is still unsupported.
+
+CPU and CUDA builds passed. The five registered CPU tests and the second-seed prefix run passed; CUDA passed both-model prefix tests at seeds 42 and 17 (64 combinations per seed), 96 Qwen prefill combinations and the grouped/joint-planner tests. Prefix tests cover a host budget equal to one suffix buffer, restored state, native decode followed by a second suffix, F32/BF16 staging, F16/Q8_0 caches and failure recovery. The final CUDA binary repeated the seed-17 prefix checks after the shared-validation cleanup. The MSVC AddressSanitizer build also passed all 64 prefix combinations at seed 42. Disabling pinning explicitly rejected the GPU call even with `--no-pipeline`; no pageable fallback was accepted.
+
+```powershell
+ctest --test-dir build-prefill -R "^(test-alloc|test-layered-prefill|test-qwen-prefill|test-layered-planner|test-layered-prefix)$" --output-on-failure
+.\build-prefill\bin\test-llama-archs.exe --layered-prefix --seed 17
+$env:CUDA_VISIBLE_DEVICES = '2'
+$env:GGML_CUDA_DISABLE_GRAPHS = '1'
+.\build-prefill-cuda\bin\test-llama-archs.exe --layered-prefix --seed 42 --backend CUDA0
+.\build-prefill-cuda\bin\test-llama-archs.exe --layered-prefix --seed 17 --backend CUDA0
+.\build-prefill-cuda\bin\test-llama-archs.exe --qwen-prefill --seed 42 --backend CUDA0
+.\build-prefill-cuda\bin\test-llama-archs.exe --layered-planner --seed 42 --backend CUDA0
+.\build-prefill-asan\bin\test-llama-archs.exe --layered-prefix --seed 42
+```
+
+These commands passed. CUDA builds used the matching MSVC 14.44 environment and CUDA 13.4; CPU builds used MSVC 14.51. Real GLM-5.3-Flash, 200K/1M capacity and corpus-level BF16 quality remain unmeasured.
+
+### Real Qwen 35B measurements
+
+The numeric record's `single_pinned_activation_prefix` section contains the exact prompt recipe, checksum, flags, order and results. This used the same T1000, Qwen3.5-35B-A3B Q4_K_M, 4096 tokens, microbatch 2048, F32 staging and 1984 MiB accounted device limit as the local streamed-weight experiment, but a separate recorded synthetic prompt. The baseline executable was saved before changing branch revision `de8d7f908`. Compilation and tests from this session finished before the serial old/new/new/old repetitions; other users' activity and GPU clocks were not controlled.
+
+| Run order | Version | Prefill ms | Tokens/s |
+| --- | --- | ---: | ---: |
+| 1 | Previous two host arrays and pinned bounce buffers | 32192.223 | 127.236 |
+| 2 | Single pinned in-place array | 35380.443 | 115.770 |
+| 3 | Single pinned in-place array | 37830.387 | 108.273 |
+| 4 | Previous two host arrays and pinned bounce buffers | 38392.224 | 106.688 |
+
+The unchanged baseline itself slowed by about 16% across the sequence, mainly in compute/wait time. An earlier candidate check measured 127.617 against 124.789 tokens/s, but it was not the interleaved comparison and the early baseline overlapped build/test activity. These runs do not establish a stable throughput gain or isolate a scheduling regression. No new clock telemetry or GPU activity capture was collected.
+
+The capacity result is direct: host activation storage falls from 64 MiB of pageable arrays plus 64 MiB of pinned bounce buffers to one 32 MiB pinned array. The four device slots stay at 64 MiB, peak accounted device storage stays at 1708934784 bytes, and expert upload stays at 19461570560 bytes. Activation H2D/D2H payloads are unchanged. All 248320 final logits in the interleaved F32 runs matched the old reference byte for byte (NMSE zero).
+
+The real-model prefix check reused 2048 tokens and evaluated only the next 2048. F32 allocated 16 MiB of pinned activations, not the full prompt's 32 MiB; the final append run took 19459.214 ms (105.246 tokens/s). BF16 allocated 8 MiB for the suffix versus 16 MiB for a full 4096-token prompt; its full/append measurements were 38187.924/20706.980 ms (107.259/98.904 tokens/s, append timing excludes seeding). Both precisions' append logits matched their same-precision full-prompt reference byte for byte. This checks state reuse and storage size on this prompt, not broad quality or a 1M-context performance claim.
+
+Reproduce using the recorded prompt file and the existing large-prompt command with `--prompt-tokens 4096 -ub 2048 --logits-file PATH`; add `--prefix-tokens 2048` for the append case and change `--staging-type` explicitly for each precision. Each run returns success; prefix seeding and model/context creation are excluded from the printed suffix prefill timing. Full logs and logits remain local.
 
 ## Implementation files
 
@@ -481,7 +524,7 @@ The final revision passed the four registered CPU prefill tests, 60 Qwen CUDA pr
 | Experimental API and execution | `src/llama-ext.h`, `src/llama-context-prefill.cpp`, `src/llama-context.h`, `src/llama-context.cpp` |
 | Cost model and build registration | `src/llama-prefill-plan.h`, `src/llama-prefill-plan.cpp`, `src/CMakeLists.txt` |
 | Grouped model graphs and compact slot lookup | `src/models/glm5-next.cpp`, `src/models/qwen35moe.cpp`, `src/llama-graph.h`, `src/llama-graph.cpp` |
-| Complete-prefix metadata replay | `src/llama-kv-cache.h`, `src/llama-kv-cache.cpp`, `src/llama-memory-recurrent.h`, `src/llama-memory-recurrent.cpp`, `src/llama-memory-hybrid-idx.h`, `src/llama-memory-hybrid-idx.cpp` |
+| Complete-prefix metadata replay and validation | `src/llama-kv-cache.h`, `src/llama-kv-cache.cpp`, `src/llama-memory-recurrent.h`, `src/llama-memory-recurrent.cpp`, `src/llama-memory-hybrid.h`, `src/llama-memory-hybrid.cpp`, `src/llama-memory-hybrid-idx.h`, `src/llama-memory-hybrid-idx.cpp` |
 | Allocation fix and tests | `ggml/src/ggml-alloc.c`, `tests/test-alloc.cpp`, `tests/test-llama-archs.cpp`, `tests/CMakeLists.txt` |
 | Measurement placement and cross-split cancellation | `ggml/src/ggml-backend.cpp`, `ggml/include/ggml-backend.h` |
 | Runnable example and documentation | `examples/layered-prefill/layered-prefill.cpp`, `docs/development/layered-prefill.md` |

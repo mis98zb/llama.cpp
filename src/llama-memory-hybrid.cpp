@@ -179,6 +179,37 @@ llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
 
+bool llama_memory_hybrid::has_complete_prefix(llama_seq_id seq_id) const {
+    if (mem_attn->has_pending_updates()) {
+        return false;
+    }
+    const llama_pos end = mem_attn->seq_pos_max(seq_id);
+    if (end != mem_recr->seq_pos_max(seq_id)) {
+        return false;
+    }
+    const auto & cells = mem_attn->get_cells(seq_id);
+    const auto & positions = cells.seq_pos_get(seq_id);
+    if (positions.size() != size_t(int64_t(end) + 1) || cells.get_used() != positions.size()) {
+        return false;
+    }
+    llama_pos expected = 0;
+    for (const auto & cell : positions) {
+        if (cell.first != expected++ || cells.seq_count(cell.second) != 1) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < mem_recr->cells.size(); ++i) {
+        const auto & cell = mem_recr->cells[i];
+        if (!cell.is_empty() && (cell.seq_id.size() != 1 || !cell.has_seq_id(seq_id))) {
+            return false;
+        }
+        if (cell.has_seq_id(seq_id) && cell.src != (int32_t) i) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
     for (const auto & buft_size : mem_recr->memory_breakdown()) {
