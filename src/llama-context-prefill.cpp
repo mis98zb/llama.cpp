@@ -8,12 +8,16 @@
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <future>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 
 namespace {
@@ -424,6 +428,133 @@ struct prefill_experts {
     }
 };
 
+struct prefill_staging_pool {
+    std::array<ggml_backend_buffer_ptr, 4> spare;
+    size_t bytes = 0;
+    size_t limit;
+    llama_layered_prefill_stats & stats;
+
+    prefill_staging_pool(size_t limit, llama_layered_prefill_stats & stats) : limit(limit), stats(stats) {}
+
+    ggml_backend_buffer_ptr take(ggml_backend_buffer_type_t buft, size_t size, size_t available) {
+        for (auto & buffer : spare) {
+            if (buffer && ggml_backend_buffer_get_type(buffer.get()) == buft &&
+                ggml_backend_buffer_get_size(buffer.get()) == size && size <= available) {
+                ++stats.weight_staging_reuses;
+                return std::move(buffer);
+            }
+        }
+        for (auto & buffer : spare) {
+            if (size <= limit - bytes) {
+                break;
+            }
+            if (buffer) {
+                bytes -= ggml_backend_buffer_get_size(buffer.get());
+                buffer.reset();
+            }
+        }
+        if (size > available || size > limit - bytes) {
+            throw llama_prefill_resource_error("retained weight staging exceeds host or transfer budget");
+        }
+        ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(buft, size));
+        if (!buffer || ggml_backend_buffer_get_type(buffer.get()) != buft ||
+            ggml_backend_buffer_get_size(buffer.get()) > available ||
+            ggml_backend_buffer_get_size(buffer.get()) > limit - bytes) {
+            throw llama_prefill_resource_error("failed to allocate bounded retained weight staging");
+        }
+        bytes += ggml_backend_buffer_get_size(buffer.get());
+        stats.peak_weight_staging_bytes = std::max(stats.peak_weight_staging_bytes, bytes);
+        ++stats.weight_staging_allocations;
+        return buffer;
+    }
+
+    void put(ggml_backend_buffer_ptr buffer) {
+        for (auto & cached : spare) {
+            if (!cached) {
+                cached = std::move(buffer);
+                return;
+            }
+        }
+        bytes -= ggml_backend_buffer_get_size(buffer.get());
+    }
+};
+
+struct prefill_staging_buffer {
+    prefill_staging_pool * pool = nullptr;
+    ggml_backend_buffer_ptr buffer;
+
+    ~prefill_staging_buffer() { reset(); }
+
+    void allocate(prefill_staging_pool * cache, ggml_backend_buffer_type_t buft, size_t bytes,
+                  size_t available, llama_layered_prefill_stats & stats) {
+        pool = cache;
+        if (pool) {
+            buffer = pool->take(buft, bytes, available);
+        } else {
+            buffer.reset(ggml_backend_buft_alloc_buffer(buft, bytes));
+            if (buffer) {
+                ++stats.weight_staging_allocations;
+            }
+        }
+    }
+
+    ggml_backend_buffer_t get() const { return buffer.get(); }
+    explicit operator bool() const { return bool(buffer); }
+
+    void reset() {
+        if (pool && buffer) {
+            pool->put(std::move(buffer));
+        } else {
+            buffer.reset();
+        }
+    }
+};
+
+struct prefill_weight_worker {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::packaged_task<void()> next;
+    bool stopping = false;
+    std::thread thread;
+
+    prefill_weight_worker() : thread([this]() {
+        for (;;) {
+            std::packaged_task<void()> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&]() { return stopping || next.valid(); });
+                if (!next.valid()) {
+                    return;
+                }
+                job = std::move(next);
+            }
+            cv.notify_all();
+            job();
+        }
+    }) {}
+
+    ~prefill_weight_worker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        cv.notify_all();
+        thread.join();
+    }
+
+    std::future<void> submit(std::function<void()> function) {
+        std::packaged_task<void()> job(std::move(function));
+        auto done = job.get_future();
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [&]() { return !next.valid(); });
+            next = std::move(job);
+        }
+        cv.notify_all();
+        return done;
+    }
+};
+
 struct prefill_static_weights {
     using member = ggml_tensor * llama_layer::*;
 
@@ -470,7 +601,7 @@ struct prefill_static_weights {
     llama_layer layer;
     ggml_context_ptr ctx;
     ggml_backend_buffer_ptr buffer;
-    ggml_backend_buffer_ptr packed;
+    prefill_staging_buffer packed;
     ggml_backend_ptr upload;
     ggml_backend_event_ptr ready;
     ggml_tensor * blob = nullptr;
@@ -478,7 +609,8 @@ struct prefill_static_weights {
 
     prefill_static_weights(const llama_layer & source, ggml_backend_t backend, size_t budget,
                            size_t host_available, size_t transfer_available, bool asynchronous,
-                           llama_layered_prefill_stats & stats, bool deferred = false) : compute(backend), layer(source) {
+                           llama_layered_prefill_stats & stats, bool deferred = false,
+                           prefill_staging_pool * pool = nullptr) : compute(backend), layer(source) {
         const size_t bytes = allocation_size(source, backend);
         if (!bytes || bytes > budget || bytes > host_available || bytes > transfer_available) {
             throw llama_prefill_resource_error("packed static layer weights exceed their device, host or transfer budget");
@@ -495,7 +627,7 @@ struct prefill_static_weights {
         if (!buffer || !host_buft) {
             throw llama_prefill_resource_error("failed to allocate static device bank or obtain pinned storage");
         }
-        packed.reset(ggml_backend_buft_alloc_buffer(host_buft, bytes));
+        packed.allocate(pool, host_buft, bytes, std::min(host_available, transfer_available), stats);
         if (!packed || ggml_backend_buffer_get_type(packed.get()) != host_buft ||
             ggml_backend_buffer_get_size(buffer.get()) > budget ||
             ggml_backend_buffer_get_size(packed.get()) > host_available ||
@@ -768,10 +900,24 @@ struct prefill_demand {
 };
 
 struct prefill_weight_prefetch {
+    static bool can_upload_direct(const llama_layer & layer, ggml_backend_t backend, bool merge_gate_up) {
+        const auto dev = ggml_backend_get_device(backend);
+        if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0 ||
+            (merge_gate_up && !layer.ffn_gate_up_exps)) {
+            return false;
+        }
+        const auto buft = ggml_backend_dev_host_buffer_type(dev);
+        const auto tensors = prefill_experts::tensors(layer);
+        return buft && !tensors.empty() && std::all_of(tensors.begin(), tensors.end(), [buft](const ggml_tensor * t) {
+            return t && t->data && t->buffer && ggml_is_contiguous(t) &&
+                ggml_backend_buffer_get_type(t->buffer) == buft;
+        });
+    }
+
     std::unique_ptr<prefill_experts> experts;
     std::vector<ggml_tensor *> source;
     ggml_backend_ptr upload;
-    ggml_backend_buffer_ptr pinned;
+    prefill_staging_buffer pinned;
     std::array<ggml_backend_event_ptr, 2> ready;
     std::array<bool, 2> pending = {};
     size_t block;
@@ -780,10 +926,13 @@ struct prefill_weight_prefetch {
     size_t submissions = 0;
     size_t copied = 0;
     size_t quota;
+    bool direct;
+    std::future<void> worker_done;
 
     prefill_weight_prefetch(std::unique_ptr<prefill_experts> bank, const llama_layer & layer,
-                            size_t block, size_t steps) :
-        experts(std::move(bank)), source(prefill_experts::tensors(layer)), block(block) {
+                            size_t block, size_t steps, llama_layered_prefill_stats & stats,
+                            prefill_staging_pool * pool = nullptr, bool direct = false) :
+        experts(std::move(bank)), source(prefill_experts::tensors(layer)), block(block), direct(direct) {
         size_t total = 0;
         for (auto * t : prefill_experts::tensors(experts->layer)) {
             total = prefill_add(total, ggml_nbytes(t));
@@ -791,41 +940,63 @@ struct prefill_weight_prefetch {
         quota = std::max<size_t>(1 << 20, total / steps + (total % steps != 0));
         const auto dev = ggml_backend_get_device(experts->backend);
         const auto buft = ggml_backend_dev_host_buffer_type(dev);
-        pinned.reset(ggml_backend_buft_alloc_buffer(buft, 2*block));
-        if (!pinned || ggml_backend_buffer_get_type(pinned.get()) != buft) {
-            return;
+        if (!direct) {
+            pinned.allocate(pool, buft, 2*block, 2*block, stats);
+            if (!pinned || ggml_backend_buffer_get_type(pinned.get()) != buft) {
+                return;
+            }
         }
         upload.reset(ggml_backend_dev_init(dev, nullptr));
-        for (auto & event : ready) {
-            event.reset(ggml_backend_event_new(dev));
+        if (!direct) {
+            for (auto & event : ready) {
+                event.reset(ggml_backend_event_new(dev));
+            }
         }
     }
 
     ~prefill_weight_prefetch() {
+        // The worker owns the upload stream and staging slots until this task completes.
+        if (worker_done.valid()) {
+            worker_done.wait();
+        }
         if (upload) {
             ggml_backend_synchronize(upload.get());
         }
     }
 
     bool available() const {
-        return pinned && upload && ready[0] && ready[1];
+        return upload && (direct || (pinned && ready[0] && ready[1]));
+    }
+
+    size_t pinned_size() const { return pinned ? ggml_backend_buffer_get_size(pinned.get()) : 0; }
+
+    void submit(prefill_weight_worker & worker) {
+        if (!worker_done.valid()) {
+            worker_done = worker.submit([this]() { advance(std::numeric_limits<size_t>::max()); });
+        }
     }
 
     size_t advance(size_t bytes) {
         const size_t before = copied;
         const auto dest = prefill_experts::tensors(experts->layer);
-        auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(pinned.get()));
+        auto * base = pinned ? static_cast<uint8_t *>(ggml_backend_buffer_get_base(pinned.get())) : nullptr;
         while (part < dest.size() && bytes > 0) {
             const size_t i = submissions % ready.size();
-            if (pending[i]) {
+            if (!direct && pending[i]) {
                 ggml_backend_event_synchronize(ready[i].get());
             }
-            const size_t n = std::min({bytes, block, ggml_nbytes(dest[part]) - offset});
-            auto * bounce = base + i*block;
-            experts->copy_source(source, part, offset, n, bounce);
-            ggml_backend_tensor_set_async(upload.get(), dest[part], bounce, offset, n);
-            ggml_backend_event_record(ready[i].get(), upload.get());
-            pending[i] = true;
+            const size_t n = std::min({bytes, direct ? bytes : block, ggml_nbytes(dest[part]) - offset});
+            if (direct) {
+                // Model storage stays alive until the upload stream has completed.
+                const auto * data = static_cast<const uint8_t *>(source[part]->data);
+                ggml_backend_tensor_set_async(upload.get(), dest[part], data + offset, offset, n);
+            } else {
+                auto * bounce = base + i*block;
+                experts->copy_source(source, part, offset, n, bounce);
+                ggml_backend_tensor_set_async(upload.get(), dest[part], bounce, offset, n);
+                ggml_backend_event_record(ready[i].get(), upload.get());
+                pending[i] = true;
+            }
             ++submissions;
             copied += n;
             bytes -= n;
@@ -839,9 +1010,15 @@ struct prefill_weight_prefetch {
     }
 
     void finish(llama_layered_prefill_stats & stats) {
-        advance(std::numeric_limits<size_t>::max());
+        if (worker_done.valid()) {
+            worker_done.get();
+            stats.weight_worker_bytes += copied;
+        } else {
+            advance(std::numeric_limits<size_t>::max());
+        }
         ggml_backend_synchronize(upload.get());
         stats.expert_copy_bytes += copied;
+        stats.direct_expert_bytes += direct ? copied : 0;
         stats.prefetched_expert_bytes += copied;
         ++stats.expert_layer_loads;
     }
@@ -851,7 +1028,7 @@ std::unique_ptr<prefill_weight_prefetch> prefill_try_prefetch(
         const llama_layer & layer, ggml_backend_t device, ggml_backend_sched_t sched,
         const llama_layered_prefill_params & params, size_t host_available, size_t transfer_available,
         size_t steps, llama_layered_prefill_stats & stats, size_t compute_reserve = 0,
-        std::unique_ptr<prefill_experts> * spare = nullptr) {
+        std::unique_ptr<prefill_experts> * spare = nullptr, prefill_staging_pool * pool = nullptr) {
     if (!layer.ffn_gate_exps && !layer.ffn_gate_up_exps) {
         return nullptr;
     }
@@ -861,6 +1038,9 @@ std::unique_ptr<prefill_weight_prefetch> prefill_try_prefetch(
         payload = prefill_add(payload, ggml_nbytes(t));
     }
     const size_t block = std::min<size_t>(8 << 20, payload);
+    const bool direct = params.stream_weights && params.test_weight_staging < 0 &&
+        prefill_weight_prefetch::can_upload_direct(layer, device, params.merge_gate_up);
+    const size_t pinned_bytes = direct ? 0 : 2*block;
     if (spare && *spare && !(*spare)->compatible(layer)) {
         spare->reset();
     }
@@ -877,7 +1057,7 @@ std::unique_ptr<prefill_weight_prefetch> prefill_try_prefetch(
     const bool fits = bytes <= params.max_prefetch_bytes && bytes <= params.max_expert_bytes &&
         additional <= free_bytes && params.prefetch_headroom_bytes <= free_bytes - additional &&
         compute_growth <= free_bytes - additional - params.prefetch_headroom_bytes &&
-        2*block <= host_available && 2*block <= transfer_available &&
+        pinned_bytes <= host_available && pinned_bytes <= transfer_available &&
         props.caps.async && props.caps.events && props.caps.host_buffer &&
         ggml_backend_dev_host_buffer_type(dev) != nullptr;
     if (!fits) {
@@ -903,8 +1083,15 @@ std::unique_ptr<prefill_weight_prefetch> prefill_try_prefetch(
         LLAMA_LOG_WARN("%s: optional prefetch allocation failed after memory check; using normal layer loading\n", __func__);
         return nullptr;
     }
-    auto prefetch = std::make_unique<prefill_weight_prefetch>(std::move(bank), layer, block, steps);
-    if (!prefetch->available() || ggml_backend_buffer_get_size(prefetch->pinned.get()) > 2*block) {
+    std::unique_ptr<prefill_weight_prefetch> prefetch;
+    try {
+        prefetch = std::make_unique<prefill_weight_prefetch>(std::move(bank), layer, block, steps, stats, pool, direct);
+    } catch (const llama_prefill_resource_error & e) {
+        ++stats.weight_prefetch_skips;
+        LLAMA_LOG_WARN("%s: optional prefetch staging unavailable: %s; using normal layer loading\n", __func__, e.what());
+        return nullptr;
+    }
+    if (!prefetch->available() || prefetch->pinned_size() > pinned_bytes) {
         ++stats.weight_prefetch_skips;
         LLAMA_LOG_WARN("%s: optional pinned prefetch staging unavailable; using normal layer loading\n", __func__);
         return nullptr;
@@ -913,7 +1100,7 @@ std::unique_ptr<prefill_weight_prefetch> prefill_try_prefetch(
     stats.peak_prefetch_bytes = std::max(stats.peak_prefetch_bytes,
                                         ggml_backend_buffer_get_size(prefetch->experts->buffer.get()));
     stats.prefetch_pinned_bytes = std::max(stats.prefetch_pinned_bytes,
-                                          ggml_backend_buffer_get_size(prefetch->pinned.get()));
+                                          prefetch->pinned_size());
     return prefetch;
 }
 
@@ -1021,6 +1208,7 @@ int llama_context::prefill_layered(
         params.n_ubatch > cparams.n_ubatch || params.max_host_bytes == 0 ||
         params.max_expert_bytes == 0 || params.max_compute_bytes == 0 ||
         params.group_layers == 0 || params.max_group_layers == 0 ||
+        params.test_weight_staging < -1 || params.test_weight_staging > 3 ||
         (params.staging_type != GGML_TYPE_F32 && params.staging_type != GGML_TYPE_BF16) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !cparams.causal_attn ||
         cparams.embeddings || cparams.embeddings_nextn || cparams.n_rs_seq != 0 || cparams.cb_eval ||
@@ -1047,7 +1235,7 @@ int llama_context::prefill_layered(
     }
     if ((params.merge_gate_up || params.defer_static_upload) &&
         (!params.stream_weights || params.expert_slots)) {
-        LLAMA_LOG_ERROR("%s: gate/up packing and deferred static uploads require streamed complete expert banks\n", __func__);
+        LLAMA_LOG_ERROR("%s: streamed weight optimizations require complete expert banks\n", __func__);
         return -1;
     }
     if (params.merge_gate_up) {
@@ -1106,7 +1294,8 @@ int llama_context::prefill_layered(
     if (!device) {
         device = backend_cpu;
     }
-    if ((params.merge_gate_up || params.defer_static_upload) && device == backend_cpu) {
+    if ((params.merge_gate_up || params.defer_static_upload) &&
+        device == backend_cpu) {
         LLAMA_LOG_ERROR("%s: streamed compute optimizations require a GPU backend\n", __func__);
         return -1;
     }
@@ -1203,6 +1392,15 @@ int llama_context::prefill_layered_run(
             pipeline = std::make_unique<prefill_pipeline>(device, hp, std::min<uint32_t>(params.n_ubatch, n_tokens),
                                                          params, stats);
         }
+        const bool cuda_staging = params.stream_weights && !params.expert_slots &&
+            std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(device))), "CUDA") == 0;
+        const int staging_mode = params.test_weight_staging < 0 ? 3 : params.test_weight_staging;
+        std::unique_ptr<prefill_staging_pool> staging_pool;
+        if (cuda_staging && (staging_mode & 1)) {
+            const size_t transfer_available = params.max_transfer_bytes - stats.transfer_buffer_bytes;
+            staging_pool = std::make_unique<prefill_staging_pool>(std::min(host_available, transfer_available), stats);
+        }
+        std::unique_ptr<prefill_weight_worker> weight_worker;
         std::vector<std::unique_ptr<prefill_weight_prefetch>> next_experts(hp.n_layer());
         std::vector<std::unique_ptr<prefill_static_weights>> next_static(hp.n_layer());
         std::unique_ptr<prefill_experts> spare_experts;
@@ -1310,19 +1508,23 @@ int llama_context::prefill_layered_run(
                     }
                     if (params.stream_weights && !params.expert_slots && device != backend_cpu) {
                         const size_t block = 8 << 20;
+                        const bool direct = params.test_weight_staging < 0 &&
+                            prefill_weight_prefetch::can_upload_direct(model.layers[lid], device, params.merge_gate_up);
+                        const size_t pinned_bytes = direct ? 0 : 2*block;
                         if (params.max_transfer_bytes < stats.transfer_buffer_bytes ||
-                            2 * block > params.max_transfer_bytes - stats.transfer_buffer_bytes ||
-                            2 * block > host_available ||
+                            pinned_bytes > params.max_transfer_bytes - stats.transfer_buffer_bytes ||
+                            pinned_bytes > host_available ||
                             !ggml_backend_dev_host_buffer_type(ggml_backend_get_device(device))) {
                             throw llama_prefill_resource_error("pinned expert upload exceeds host or transfer budget");
                         }
-                        prefill_weight_prefetch loading(std::move(bank), model.layers[lid], block, 1);
-                        if (!loading.available() || ggml_backend_buffer_get_size(loading.pinned.get()) > 2 * block) {
+                        prefill_weight_prefetch loading(std::move(bank), model.layers[lid], block, 1, stats, staging_pool.get(), direct);
+                        if (!loading.available() || loading.pinned_size() > pinned_bytes) {
                             throw llama_prefill_resource_error("failed to allocate pinned expert upload buffers");
                         }
                         llama_layered_prefill_stats copied;
                         loading.finish(copied);
                         stats.expert_copy_bytes += copied.expert_copy_bytes;
+                        stats.direct_expert_bytes += copied.direct_expert_bytes;
                         stats.expert_layer_loads += copied.expert_layer_loads;
                         bank = std::move(loading.experts);
                     }
@@ -1336,7 +1538,7 @@ int llama_context::prefill_layered_run(
                 if (!current) {
                     current = std::make_unique<prefill_static_weights>(model.layers[il], device, params.max_static_bytes,
                         host_available,
-                        params.max_transfer_bytes - stats.transfer_buffer_bytes, false, stats);
+                        params.max_transfer_bytes - stats.transfer_buffer_bytes, false, stats, false, staging_pool.get());
                 }
                 current->apply(weights[0]);
                 stats.peak_static_bytes = std::max(stats.peak_static_bytes, current->size());
@@ -1538,10 +1740,10 @@ int llama_context::prefill_layered_run(
                             probe && probe->prefetch_steps ? probe->prefetch_steps :
                                 ((size_t) n_tokens + params.n_ubatch - 1) / params.n_ubatch,
                             stats, device_ceiling ? device_ceiling : compute_ceiling,
-                            params.stream_weights ? &spare_experts : nullptr);
+                            params.stream_weights ? &spare_experts : nullptr, staging_pool.get());
                         if (next_experts[last + p]) {
                             extra_bytes += ggml_backend_buffer_get_size(next_experts[last + p]->experts->buffer.get());
-                            extra_pinned += ggml_backend_buffer_get_size(next_experts[last + p]->pinned.get());
+                            extra_pinned += next_experts[last + p]->pinned_size();
                         } else if (model.layers[last + p].ffn_gate_exps || model.layers[last + p].ffn_gate_up_exps) {
                             break;
                         }
@@ -1559,7 +1761,7 @@ int llama_context::prefill_layered_run(
                     for (uint32_t lid = last; lid < hp.n_layer(); ++lid) {
                         if (next_experts[lid]) {
                             expert_pinned = prefill_add(expert_pinned,
-                                ggml_backend_buffer_get_size(next_experts[lid]->pinned.get()));
+                                next_experts[lid]->pinned_size());
                         }
                     }
                     const size_t transfer_used = prefill_add(stats.transfer_buffer_bytes, expert_pinned);
@@ -1578,7 +1780,7 @@ int llama_context::prefill_layered_run(
                             next_static[last] = std::make_unique<prefill_static_weights>(model.layers[last], device,
                                 params.max_static_bytes - current,
                                 params.max_host_bytes - host_used,
-                                params.max_transfer_bytes - transfer_used, true, stats, params.defer_static_upload);
+                                params.max_transfer_bytes - transfer_used, true, stats, params.defer_static_upload, staging_pool.get());
                             stats.peak_static_bytes = std::max(stats.peak_static_bytes, current + next_static[last]->size());
                         } catch (const llama_prefill_resource_error & e) {
                             ++stats.static_prefetch_skips;
@@ -1613,7 +1815,14 @@ int llama_context::prefill_layered_run(
                 }
                 for (uint32_t p = 0; p < group.n_prefetch_layers && status == GGML_STATUS_SUCCESS; ++p) {
                     if (next_experts[last + p]) {
-                        stats.weight_prefetch_submit_bytes += next_experts[last + p]->advance(next_experts[last + p]->quota);
+                        if (cuda_staging && (staging_mode & 2)) {
+                            if (!weight_worker) {
+                                weight_worker = std::make_unique<prefill_weight_worker>();
+                            }
+                            next_experts[last + p]->submit(*weight_worker);
+                        } else {
+                            stats.weight_prefetch_submit_bytes += next_experts[last + p]->advance(next_experts[last + p]->quota);
+                        }
                     }
                 }
                 enqueue_range.close();

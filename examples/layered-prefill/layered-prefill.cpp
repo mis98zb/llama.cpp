@@ -174,6 +174,7 @@ int main(int argc, char ** argv) {
                                 LOG("Nsight CUDA activity capture: --profile-gpu (one manual prefill, no sweep/prefix)\n");
                                 LOG("Streamed complete-bank experiments: --merge-gate-up, --defer-static-upload\n");
                                 LOG("Compare all four experiments twice with one host model: --compare-optimizations (-n 0)\n");
+                                LOG("CUDA streamed complete banks automatically reuse weight staging and upload admitted expert prefetches on a worker\n");
                             })) {
         return 1;
     }
@@ -303,6 +304,10 @@ int main(int argc, char ** argv) {
                 LOG_INF("expert device allocations=%u, reuses=%u\n", stats.expert_allocations, stats.expert_reuses);
                 LOG_INF("merged expert layers=%u, deferred static upload=%d\n",
                         stats.merged_expert_layers, pp.defer_static_upload);
+                LOG_INF("weight staging allocations=%u, reuses=%u, peak pinned bytes=%zu, worker bytes=%" PRIu64 "\n",
+                        stats.weight_staging_allocations, stats.weight_staging_reuses,
+                        stats.peak_weight_staging_bytes, stats.weight_worker_bytes);
+                LOG_INF("direct expert upload bytes=%" PRIu64 "\n", stats.direct_expert_bytes);
                 LOG_INF("device state bytes=%zu, peak accounted device bytes=%zu\n",
                         stats.resident_state_bytes, stats.peak_device_bytes);
                 LOG_INF("streamed weights=%d, static layer loads=%u, static bytes=%" PRIu64

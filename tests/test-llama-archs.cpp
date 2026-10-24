@@ -110,6 +110,8 @@ static void usage(char ** argv) {
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --layered-prefill        Test experimental GLM5-Next layer-major prefill\n");
     LOG("  --qwen-prefill           Test Qwen3.5 layer-major and route-driven prefill\n");
+    LOG("  --weight-staging         Test bounded streamed weight staging and worker uploads\n");
+    LOG("  --direct-weight-upload   Test direct pinned expert uploads and staging fallbacks\n");
     LOG("  --layered-planner        Test grouped execution and joint planning\n");
     LOG("  --layered-prefix         Test resident hybrid prefix reuse\n");
     LOG("  -h, --help               Show this help message\n\n");
@@ -526,7 +528,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
         uint32_t ubatch_size = 64, ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_data = nullptr,
-        ggml_type cache_k = GGML_TYPE_F16, int32_t gpu_layers = -1, bool defer_compute = false) {
+        ggml_type cache_k = GGML_TYPE_F16, int32_t gpu_layers = -1, bool defer_compute = false, bool no_host = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -535,6 +537,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
+    model_params.no_host = no_host;
     if (gpu_layers >= 0) {
         model_params.n_gpu_layers = gpu_layers;
     }
@@ -650,7 +653,8 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                                 bool quantized, bool pipeline, int prefetch_mode = 0, uint32_t group_layers = 1,
                                 bool qwen = false, uint32_t slots = 0, bool cpu_non_experts = true,
                                 bool stream_weights = false, ggml_type cache_type = GGML_TYPE_F16,
-                                bool merge_gate_up = false, bool defer_static_upload = false) {
+                                bool merge_gate_up = false, bool defer_static_upload = false, int staging_mode = -2,
+                                bool no_host = false) {
     const auto tokens = get_tokens(137, 128, seed);
     uint64_t expected_copies = 0;
     uint32_t n_cases = 0;
@@ -664,7 +668,9 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
     const llama_model_tensor_buft_override streamed[] = {
         { ".*", ggml_backend_cpu_buffer_type() }, { nullptr, nullptr },
     };
-    for (uint32_t ubatch : qwen ? std::vector<uint32_t>{1, 3, 7} : std::vector<uint32_t>{7, 32, 64}) {
+    const auto batches = staging_mode >= -1 ? std::vector<uint32_t>{32, 256} :
+        (qwen ? std::vector<uint32_t>{1, 3, 7} : std::vector<uint32_t>{7, 32, 64});
+    for (uint32_t ubatch : batches) {
         for (ggml_type staging : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
             auto metadata = qwen ? get_gguf_ctx(LLM_ARCH_QWEN35MOE, true) : layered_metadata(quantized);
             if (qwen) {
@@ -708,7 +714,7 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                                                LLAMA_SPLIT_MODE_LAYER, false, stream_weights ? streamed : overrides, 0, ubatch,
                                                nullptr, nullptr, cache_type,
                                                stream_weights ? INT32_MAX : (qwen && cpu_non_experts ? 0 : -1),
-                                               stream_weights);
+                                               stream_weights, no_host);
             auto & layered = candidate.second;
             if (merge_gate_up) {
                 split_context.reset(ggml_init({8 * ggml_tensor_overhead(), nullptr, true}));
@@ -757,6 +763,7 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             pp.stream_weights = stream_weights;
             pp.merge_gate_up = merge_gate_up;
             pp.defer_static_upload = defer_static_upload;
+            pp.test_weight_staging = staging_mode >= -1 ? staging_mode : -1;
             pp.weight_prefetch = prefetch_mode != 0;
             if (prefetch_mode) {
                 pp.max_compute_bytes = size_t(64) << 20;
@@ -782,6 +789,15 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                 pp.merge_gate_up = merge_gate_up;
                 pp.defer_static_upload = defer_static_upload;
             }
+            const int test_mode = pp.test_weight_staging;
+            for (int invalid_mode : {-2, 4}) {
+                pp.test_weight_staging = invalid_mode;
+                if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -1 ||
+                    llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                    throw std::runtime_error("invalid weight staging test mode accepted or changed state");
+                }
+            }
+            pp.test_weight_staging = test_mode;
             const llama_token invalid = 128;
             if (llama_prefill_layered(layered.get(), &invalid, 1, pp) != -1) {
                 throw std::runtime_error("layered prefill accepted an invalid token");
@@ -826,6 +842,33 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             }
             if (stream_weights && gpu && (stats.expert_allocations > 2 || stats.expert_reuses < 2)) {
                 throw std::runtime_error("streamed expert device banks were not reused");
+            }
+            const bool cuda_staging = stream_weights && !slots && gpu &&
+                std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devices[0])), "CUDA") == 0;
+            const int mode = pp.test_weight_staging < 0 ? 3 : pp.test_weight_staging;
+            const bool staging_reuse = cuda_staging && (mode & 1);
+            const bool staging_worker = cuda_staging && (mode & 2);
+            const bool direct = cuda_staging && pp.test_weight_staging < 0 && !merge_gate_up && !no_host;
+            if (stats.direct_expert_bytes != (direct ? stats.expert_copy_bytes : 0) ||
+                (direct && stats.prefetch_pinned_bytes)) {
+                throw std::runtime_error("direct expert upload did not match pinned/layout eligibility");
+            }
+            if (staging_reuse &&
+                (stats.weight_staging_reuses == 0 || stats.peak_weight_staging_bytes == 0 ||
+                 stats.peak_weight_staging_bytes > pp.max_transfer_bytes - stats.transfer_buffer_bytes)) {
+                throw std::runtime_error("weight staging was not reused within its transfer budget");
+            }
+            if (!staging_reuse && (stats.weight_staging_reuses || stats.peak_weight_staging_bytes)) {
+                throw std::runtime_error("weight staging reuse ran outside the selected CUDA complete-bank path");
+            }
+            if (staging_worker && stats.weight_worker_bytes != stats.prefetched_expert_bytes) {
+                throw std::runtime_error("worker did not upload each admitted complete expert prefetch");
+            }
+            if (!staging_worker && stats.weight_worker_bytes) {
+                throw std::runtime_error("weight worker ran without being requested");
+            }
+            if (staging_worker && prefetch_mode == 1 && stats.weight_worker_bytes == 0) {
+                throw std::runtime_error("weight worker was not used");
             }
             if (stats.pipeline_active != (pipeline && gpu)) {
                 throw std::runtime_error("layered prefill pipeline was not activated as requested");
@@ -965,13 +1008,13 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
                 throw std::runtime_error("single-token prefill after failure differs from ordinary decode");
             }
-            LOG("layered prefill: ubatch=%u group=%u staging=%s quantized=%d pipeline=%d prefetch=%u skip=%u, logits/state/decode/budgets OK, expert bytes=%" PRIu64 "\n",
+            LOG("layered prefill: ubatch=%u group=%u staging=%s quantized=%d pipeline=%d prefetch=%u skip=%u staging-mode=%d, logits/state/decode/budgets OK, expert bytes=%" PRIu64 "\n",
                 ubatch, group_layers, ggml_type_name(staging), quantized, stats.pipeline_active,
-                stats.weight_prefetches, stats.weight_prefetch_skips, stats.expert_copy_bytes);
+                stats.weight_prefetches, stats.weight_prefetch_skips, pp.test_weight_staging, stats.expert_copy_bytes);
             ++n_cases;
         }
     }
-    if (n_cases != 6) {
+    if (n_cases != 2 * batches.size()) {
         throw std::runtime_error("not all layered prefill test cases executed");
     }
     return 0;
@@ -2015,6 +2058,8 @@ int main(int argc, char ** argv) {
     bool joint_only = false;
     bool layered_prefix = false;
     bool qwen_prefill = false;
+    bool weight_staging = false;
+    bool direct_weight_upload = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2026,6 +2071,10 @@ int main(int argc, char ** argv) {
             layered_prefill = true;
         } else if (strcmp(argv[i], "--qwen-prefill") == 0) {
             qwen_prefill = true;
+        } else if (strcmp(argv[i], "--weight-staging") == 0) {
+            weight_staging = true;
+        } else if (strcmp(argv[i], "--direct-weight-upload") == 0) {
+            direct_weight_upload = true;
         } else if (strcmp(argv[i], "--layered-planner") == 0) {
             layered_planner = true;
         } else if (strcmp(argv[i], "--joint-only") == 0) {
@@ -2106,6 +2155,52 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (direct_weight_upload) {
+            common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
+            if (!target_backend) {
+                return test_layered_prefill(seed, stdev, nullptr, true, false, 0, 1, true, 0,
+                                            true, true, GGML_TYPE_F16, false, false, -1);
+            }
+            for (bool no_host : {false, true}) {
+                if (test_layered_prefill(seed, stdev, target_backend, true, true, 1, 1, true, 0,
+                                        false, true, GGML_TYPE_Q8_0, false, true, -1, no_host)) {
+                    return 1;
+                }
+            }
+            if (test_layered_prefill(seed, stdev, target_backend, true, true, 1, 1, true, 0,
+                                    false, true, GGML_TYPE_Q8_0, false, true, 3) ||
+                test_layered_prefill(seed, stdev, target_backend, true, true, 1, 1, true, 0,
+                                    false, true, GGML_TYPE_Q8_0, true, true, -1)) {
+                return 1;
+            }
+            for (int prefetch : {0, 2}) {
+                if (test_layered_prefill(seed, stdev, target_backend, true, false, prefetch, 1, true, 0,
+                                        false, true, GGML_TYPE_F16, false, false, -1)) {
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        if (weight_staging) {
+            common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
+            if (!target_backend) {
+                return test_layered_prefill(seed, stdev, nullptr, true, false, 0, 1, true, 0,
+                                            true, true, GGML_TYPE_F16, false, false, -1);
+            }
+            for (int mode : {0, 1, 2, -1}) {
+                if (test_layered_prefill(seed, stdev, target_backend, true, true, 1, 1, true, 0,
+                                        false, true, GGML_TYPE_Q8_0, true, true, mode)) {
+                    return 1;
+                }
+            }
+            for (int prefetch : {0, 2}) {
+                if (test_layered_prefill(seed, stdev, target_backend, true, false, prefetch, 1, true, 0,
+                                        false, true, GGML_TYPE_F16, true, false, -1)) {
+                    return 1;
+                }
+            }
+            return 0;
+        }
         if (qwen_prefill) {
             common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
             for (bool quantized : {false, true}) {
