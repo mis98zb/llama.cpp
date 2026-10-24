@@ -300,6 +300,29 @@ At large microbatches the routed union can cover nearly all 256 experts. Compare
 
 Phase counters separate current-weight loading, graph/input setup, compute plus waits, and activation-copy submission. Prefetch staging work can appear in setup or compute/wait time; these are selected host wall-time intervals, not exhaustive partitions or isolated CUDA kernel/hardware-overlap measurements.
 
+#### Automatic CUDA weight staging
+
+CUDA execution with streamed complete expert banks (`--stream-weights` and `--expert-slots 0`) automatically reuses weight staging and uploads admitted next-layer expert banks on a worker. No additional switches are needed. Other backends, CPU execution, non-streamed weights and route-driven expert slots keep their existing paths.
+
+Pinned expert-upload and packed-static-weight buffers are retained within one prefill. The cache has four spare slots and reuses exact-size buffers. Active and cached allocations share the remaining host and transfer budgets after activation staging. Unused cached buffers are released when another allocation needs the space. DMA completion is checked before a buffer is returned to the cache; all cached storage is freed when prefill ends. Device-bank layout, graph construction and scheduler workspace reuse are unchanged.
+
+One worker with at most one queued task packs and submits admitted next-layer expert banks. It is created lazily after the current layer's first successful graph submission, when there is an admitted expert prefetch to submit. It streams the complete next bank through the existing two event-protected slots, rather than copying a quota on the compute-submission thread after each microbatch. The next layer waits for task completion and upload completion before consuming the bank. Worker exceptions propagate to the prefill caller; cleanup joins outstanding work before releasing its tensors, events or staging buffers. Static-weight packing remains on the calling thread.
+
+Prefetch admission is unchanged: with weight prefetch disabled or rejected, no worker is created, and mandatory expert/static loading still reuses staging. `weight_worker_bytes` counts bytes actually submitted by completed worker tasks; it is separate from `weight_prefetch_submit_bytes`, which counts the original caller-thread quota submissions on unchanged paths. Neither counter measures physical overlap. Allocation/reuse counters and peak retained pinned bytes expose cache behavior.
+
+A/B selection is restricted to the test-only `test_weight_staging` parameter: -1 selects automatic behavior, while 0..3 select the baseline/reuse/worker/both bitmask on the eligible CUDA path. It cannot enable these optimizations on other paths. The example CLI does not expose staging switches or staging comparison mode. Run `test-llama-archs --weight-staging --seed 42 --backend CUDA0` for baseline, isolated optimizations, automatic behavior and disabled/rejected prefetch coverage; the CPU form checks that automatic selection leaves synchronous execution unchanged. Keep the prompt, microbatch and budgets fixed when comparing logits.
+
+Before making staging automatic, a local RTX 3070 8 GiB with PCIe 3.0 x16 and Xeon Silver 4112 produced the following mean throughputs from two points per mode, in forward/reverse order, using the 4096-token reference prompt at microbatch 1024. Both Q4_K_M models used F32 staging, four CPU threads, Flash Attention, disabled CUDA Graphs and a 5632 MiB device budget selected from available VRAM. The 35B compute/group limits were 2048/1536 MiB; the 122B limits were 1024/3584 MiB. Both used static/transfer limits of 256/2048 MiB and 128 MiB device headroom.
+
+| Model | Baseline tokens/s | Reuse only | Worker only | Both | Both / baseline |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5-35B-A3B | 386.488 | 510.846 | 560.962 | 744.353 | 1.926 |
+| Qwen3.5-122B-A10B | 150.575 | 184.743 | 180.931 | 233.098 | 1.548 |
+
+All eight final-token logits files per model matched their same-microbatch baseline byte-for-byte. With both optimizations, weight-staging allocations fell from 80 to 3 for 35B and from 96 to 3 for 122B, with peak retained weight staging of 88.3 and 210.7 MiB respectively. These are local paired measurements, not replacements for earlier T1000/3070 sweeps or confidence bounds; system conditions and sample order affect throughput.
+
+A separate baseline/both Nsight comparison on 35B reduced the captured prefill window from 10.887 to 6.797 seconds. Within that window, `cudaMallocHost` calls fell from 82 to 5, with summed allocation time falling from 1.286 to 0.081 seconds. H2D/kernel overlap coverage increased from 15.3% to 26.1%, while H2D payload remained 22,667,848,676 bytes. Time without traced process GPU activity fell from 7.799 to 3.689 seconds. The capture ends before run-scoped cache cleanup, whereas the unprofiled throughput above includes cleanup. Profiled timings are not interchangeable with unprofiled timings, and the remaining gaps still include host preparation and submission; the GPU is not continuously busy.
+
 #### Opt-in streamed compute experiments
 
 Two switches apply only to GPU execution with `--stream-weights` and complete expert banks (`--expert-slots 0`). Neither changes the default path, the host model, the requested microbatch, the total expert payload or the device-budget policy.

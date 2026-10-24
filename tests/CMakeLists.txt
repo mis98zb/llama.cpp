@@ -227,6 +227,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-llama-archs.cpp)
     llama_test(test-llama-archs NAME test-layered-prefill ARGS --layered-prefill --seed 42)
     llama_test(test-llama-archs NAME test-qwen-prefill ARGS --qwen-prefill --seed 42)
+    llama_test(test-llama-archs NAME test-weight-staging ARGS --weight-staging --seed 42)
     llama_test(test-llama-archs NAME test-layered-planner ARGS --layered-planner --seed 42)
     llama_test(test-llama-archs NAME test-layered-prefix ARGS --layered-prefix --seed 42)
 

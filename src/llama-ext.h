@@ -57,6 +57,7 @@ struct llama_layered_prefill_params {
     bool profile_gpu = false; // CUDA profiler capture range and NVTX labels; use an external activity collector
     bool merge_gate_up = false; // pack compatible streamed gate/up experts for one matrix product
     bool defer_static_upload = false; // prepare next-layer static weights before compute, submit DMA afterwards
+    int32_t test_weight_staging = -1; // tests only: -1 automatic; 0..3 reuse/worker bitmask
 };
 
 struct llama_layered_prefill_stats {
@@ -115,6 +116,10 @@ struct llama_layered_prefill_stats {
     uint32_t expert_reuses = 0;
     size_t peak_device_bytes = 0;
     uint32_t merged_expert_layers = 0;
+    uint32_t weight_staging_allocations = 0;
+    uint32_t weight_staging_reuses = 0;
+    size_t peak_weight_staging_bytes = 0;
+    uint64_t weight_worker_bytes = 0;
 };
 
 // Allocate persistent state and scheduler metadata, without full-model compute buffers.
