@@ -301,6 +301,7 @@ int main(int argc, char ** argv) {
                 LOG_INF("weight staging allocations=%u, reuses=%u, peak pinned bytes=%zu, worker bytes=%" PRIu64 "\n",
                         stats.weight_staging_allocations, stats.weight_staging_reuses,
                         stats.peak_weight_staging_bytes, stats.weight_worker_bytes);
+                LOG_INF("direct expert upload bytes=%" PRIu64 "\n", stats.direct_expert_bytes);
                 LOG_INF("device state bytes=%zu, peak accounted device bytes=%zu\n",
                         stats.resident_state_bytes, stats.peak_device_bytes);
                 LOG_INF("streamed weights=%d, static layer loads=%u, static bytes=%" PRIu64

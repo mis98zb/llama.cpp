@@ -221,9 +221,105 @@
       "Real-model comparisons cover final-token logits on one synthetic technical prompt, not corpus perplexity or broad quality.",
       "No new 122B matched demand comparisons completed after the large sweep: private host allocation hit the Windows commit limit.",
       "The corrected mmap+mlock retry was prepared but not executed; page locking is not claimed to have succeeded.",
-      "No local RTX 3060, 3070 or 3080 throughput was measured.",
+      "The T1000 results above do not measure RTX performance; the separate RTX 3070 comparison below records local throughput. No local RTX 3060 or 3080 throughput was measured.",
       "No CPU sampling, GPU clock telemetry, SM occupancy or memory-throughput counters were captured.",
       "Raw Nsight reports, SQLite captures, Chrome traces and full logs remain local because they can contain environment metadata."
+    ]
+  },
+  "rtx3070_direct_upload_comparison": {
+    "scope": "Separate local RTX 3070 experiment; the top-level environment, sweeps, captures and conclusions describe the earlier T1000 experiment.",
+    "environment": {
+      "os": "Windows",
+      "cpu": "Intel Xeon Silver 4112",
+      "host_ram_gib": 128,
+      "gpu": "NVIDIA GeForce RTX 3070 8 GB",
+      "pcie_link_under_load": "Gen3 x16",
+      "cuda_architecture": 86,
+      "cuda_toolkit": "12.6",
+      "cuda_build_msvc": "14.44",
+      "cpu_threads": 4,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0,
+      "cuda_graphs_disabled": true
+    },
+    "settings": {
+      "prompt": "Same exact top-level prompt recipe and SHA-256.",
+      "prompt_tokens": 4096,
+      "context_tokens": 4096,
+      "logical_batch": 4096,
+      "microbatch": 1024,
+      "generated_tokens": 0,
+      "activation_staging": "F32",
+      "flash_attention": true,
+      "stream_weights": true,
+      "load_mode": "none",
+      "expert_slots": 0,
+      "weight_prefetch": true,
+      "merge_gate_up": false,
+      "defer_static_upload": false,
+      "static_budget_mib": 256,
+      "transfer_budget_mib": 2048,
+      "accounted_device_budget_mib": 5632,
+      "device_headroom_mib": 128,
+      "device_budget_policy": "Free VRAM minus 768 MiB, rounded down to 256 MiB; held fixed across all eight runs.",
+      "timing": "Unprofiled prefill wall time including run-scoped cleanup, excluding model loading and context creation."
+    },
+    "baseline_commit": "14ce9cf0df3fc719793ace48fece0e913e39f7b4",
+    "baseline": "Automatic staging reuse and bounded worker uploads through pinned bounce buffers.",
+    "direct": "Automatic uploads from compatible CUDA_Host expert tensors; packed static weights retain staging.",
+    "order_per_model": ["staged", "direct", "direct", "staged"],
+    "models": {
+      "35b": {
+        "compute_budget_mib": 2048,
+        "group_budget_mib": 1536,
+        "expert_upload_bytes": 19461570560,
+        "staged_mean_tokens_per_second": 680.4575,
+        "direct_mean_tokens_per_second": 682.492,
+        "direct_over_staged": 1.002989900177454,
+        "staged_weight_staging_allocations": 3,
+        "direct_weight_staging_allocations": 2,
+        "staged_peak_weight_staging_bytes": 92596992,
+        "direct_peak_weight_staging_bytes": 75819776,
+        "direct_expert_bytes": 19461570560,
+        "direct_expert_host_staging_copy_bytes": 0
+      },
+      "122b": {
+        "compute_budget_mib": 1024,
+        "group_budget_mib": 3584,
+        "expert_upload_bytes": 70061654016,
+        "staged_mean_tokens_per_second": 192.2715,
+        "direct_mean_tokens_per_second": 267.9555,
+        "direct_over_staged": 1.3936308813318667,
+        "staged_weight_staging_allocations": 3,
+        "direct_weight_staging_allocations": 2,
+        "staged_peak_weight_staging_bytes": 220957696,
+        "direct_peak_weight_staging_bytes": 204180480,
+        "direct_expert_bytes": 70061654016,
+        "direct_expert_host_staging_copy_bytes": 0
+      }
+    },
+    "runs": [
+      {"model": "35b", "mode": "staged", "order": 1, "wall_ms": 5825.832, "tokens_per_second": 703.076},
+      {"model": "35b", "mode": "direct", "order": 2, "wall_ms": 5930.887, "tokens_per_second": 690.622},
+      {"model": "35b", "mode": "direct", "order": 3, "wall_ms": 6073.885, "tokens_per_second": 674.362},
+      {"model": "35b", "mode": "staged", "order": 4, "wall_ms": 6226.443, "tokens_per_second": 657.839},
+      {"model": "122b", "mode": "staged", "order": 1, "wall_ms": 24373.859, "tokens_per_second": 168.049},
+      {"model": "122b", "mode": "direct", "order": 2, "wall_ms": 15360.284, "tokens_per_second": 266.662},
+      {"model": "122b", "mode": "direct", "order": 3, "wall_ms": 15212.698, "tokens_per_second": 269.249},
+      {"model": "122b", "mode": "staged", "order": 4, "wall_ms": 18919.736, "tokens_per_second": 216.494}
+    ],
+    "validation": {
+      "cpu_weight_staging_ctest_passed": true,
+      "cuda_direct_upload_cases_passed": 24,
+      "real_model_runs": 8,
+      "all_final_logits_match_prior_same_microbatch_reference_byte_for_byte": true
+    },
+    "limitations": [
+      "Two samples per mode, with substantial staged 122B variation; means are local observations, not confidence bounds.",
+      "The 35B difference does not establish a speedup.",
+      "Do not compare these means directly with older runs performed under different conditions.",
+      "Direct expert uploads do not remove the approximately 71 GiB resident pinned 122B model or reduce expert H2D payload.",
+      "Raw logs and logits remain local; machine-specific artifact paths are not included."
     ]
   },
   "conclusions": [
