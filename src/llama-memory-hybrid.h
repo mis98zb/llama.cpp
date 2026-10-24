@@ -125,6 +125,9 @@ public:
     // llama_memory_hybrid_context
     //
 
+    // Only the cursors are reset; the caller must restore the memory metadata first.
+    virtual void rewind();
+
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
 

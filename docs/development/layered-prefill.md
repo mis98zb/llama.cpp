@@ -300,6 +300,52 @@ At large microbatches the routed union can cover nearly all 256 experts. Compare
 
 Phase counters separate current-weight loading, graph/input setup, compute plus waits, and activation-copy submission. Prefetch staging work can appear in setup or compute/wait time; these are selected host wall-time intervals, not exhaustive partitions or isolated CUDA kernel/hardware-overlap measurements.
 
+The example also reports metadata restore, batch initialization and memory preparation separately from the microbatch setup interval. Setup details split memory apply, both graph builds, workspace measurement/admission, graph allocation, input construction, activation-input waits and prefetch admission. These are host wall times: input construction includes attention masks and other graph inputs, while workspace measurement can include synchronization. The matching NVTX subranges allow correlation with actual CUDA activities; do not add nested setup details to the parent setup total.
+
+Batch initialization, microbatch splitting and cache-slot preparation run once per layered call. Later groups restore the original cache metadata and rewind the prepared attention, recurrent and indexer context cursors. Each microbatch still applies its state, and each layer still writes its own cache tensors. Indexer replay also discards derived pool state and reads the restored stale-pool metadata. The plan is local to the call and is not reused across prefix changes, requests or different microbatch sizes. `plan-reuses` reports the number of later groups that reuse it.
+
+Ordinary causal masks use a contiguous-cache fast path when one sequence occupies a consecutive prefix of the addressed cells with consecutive positions, followed only by empty padding. Each row is filled as visible and masked spans rather than checking sequence membership for every query/key pair. M-RoPE still checks the spatial ordering at an equal position. ALiBi, sliding-window attention, multiple streams, mixed query sequences, fragmented cells and nonconsecutive positions keep the generic mask implementation. The fast path changes neither mask values nor attention precision and does not allocate a whole-prompt mask cache.
+
+Hybrid attention inputs use the configured batch thread count (`-tb`) to fill large contiguous masks in disjoint row ranges. Masks smaller than 8 MiB remain serial; larger masks use at most one thread per 4 MiB and never more threads than rows or the configured count. The calling thread fills one range. Extra workers are created lazily, sleep between fills, and are retained by the KV cache until its destruction or a different parallel thread limit is requested. Layout validation runs once before any worker writes, and filling completes before graph submission. Generic masks remain serial. Changing thread counts invalidates the affected hybrid graph input's reuse decision.
+
+The `mask` line reports time within input construction, including layout validation, filling and worker dispatch, plus the number of mask calls, parallel calls and maximum threads actually used in this layered call. It is not an additional phase to add to `inputs`. `test-kv-mask` checks serial and parallel output against a scalar reference, rejected layouts without writes, and worker growth and uneven row partitions. Its optional `--bench` mode measures 64,000-token mask construction at microbatch 2048 for F16/F32 storage and thread limits 1, 2, 4, 8, 12 and 24; it excludes attention computation and DMA. Each point has one warmup traversal and reports the median and sorted samples of three timed traversals.
+
+On an RTX 3070 8 GiB with a Xeon Platinum 8268, a 64,000-token Qwen3.5-122B-A10B Q4_K_M prompt measured the following progression. These are single unprofiled runs with microbatch 2048, 24 inference/batch threads, F16 K/V, F32 activation staging, complete streamed expert banks, a 4096 MiB workspace ceiling and a 6144 MiB device budget. CUDA Graphs were disabled; there was no generated output. Wall time excludes model/context creation but includes run-local cleanup.
+
+| Implementation | Wall seconds | Tokens/s | Graph/input setup seconds | Batch initialization seconds | Memory preparation seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 277.891 | 230.306 | 134.684 | Not separately measured | Not separately measured |
+| Contiguous mask plus detailed timing | 156.496 | 408.957 | 16.652 | 4.609 | 59.474 |
+| Plus request-local batch/cache plan reuse | 93.518 | 684.360 | 16.647 | 0.070 | 1.217 |
+
+The final run reused its memory plan for 47 later groups; expert upload remained 70,061,654,016 bytes and peak measured workspace remained 922,877,952 bytes. Separate Nsight captures reduced time without traced GPU activity from 203.712 of 280.723 seconds (72.6%) to 20.857 of 94.584 seconds (22.1%). Kernel-active interval coverage increased from 22.4% to 63.0%; this is not SM occupancy. H2D and D2H payloads were unchanged. Profiled windows exclude some cleanup and are not interchangeable with the unprofiled wall times above. These results are not a statistical throughput estimate or evidence for an isolated CUDA Graph/prefetch improvement: both graph rebuilding and weight-prefetch admission remain unchanged.
+
+`test-kv-mask` compares both mask storage types against a scalar reference, including padding, nonzero positions, M-RoPE ties and rejected fragmented/mixed-sequence layouts. The existing `test-llama-archs --direct-weight-upload --backend CUDA0 --seed 42` and `test-llama-archs --layered-prefix --seed 42` cover streamed Qwen execution and default CPU GLM/Qwen prefix continuation, respectively, including state, subsequent decode and resource-admission checks.
+
+#### Parallel mask measurements
+
+A follow-up on the same RTX 3070/Xeon Platinum system kept the 64,000-token prompt, microbatch, precision and budgets above. A fresh previous-code control with `-t 24 -tb 24` measured 94.369 seconds (678.191 tokens/s). The parallel implementation measured:
+
+| Batch thread limit | Wall seconds | Tokens/s | All graph inputs seconds | Mask seconds | Parallel mask calls |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 24 | 89.598 | 714.306 | 2.205 | 2.082 | 384 |
+| 1 | 94.214 | 679.307 | 6.772 | 6.655 | 0 |
+
+Inference threads stayed at 24 in both follow-up runs; only the batch thread limit changed for the serial comparison. All 993,280 final-logits bytes matched between them. The parallel run used up to 24 threads and reduced total graph/input setup to 12.570 seconds. Expert upload and measured workspace remained 70,061,654,016 and 922,877,952 bytes, respectively. The 5.3% throughput gain over the fresh same-configuration control is a single-run observation, not a confidence bound. Neither graph reuse nor prefetch admission was changed.
+
+The standalone `test-kv-mask --bench` measured these median milliseconds for one traversal of the 64,000-token input's masks, not all 12 attention layers:
+
+| Thread limit | F16 mask ms | F32 mask ms |
+| --- | ---: | ---: |
+| 1 | 527.789 | 814.723 |
+| 2 | 388.075 | 584.012 |
+| 4 | 341.282 | 422.634 |
+| 8 | 239.796 | 247.292 |
+| 12 | 205.485 | 270.572 |
+| 24 | 188.490 | 281.573 |
+
+These measurements include contiguous-layout validation and worker dispatch, but exclude model execution and transfers. F16 benefited through 24 threads in this scan; F32 did not improve beyond eight. More threads are not a portable guarantee of better memory-bandwidth performance.
+
 #### Automatic CUDA weight staging
 
 CUDA execution with streamed complete expert banks (`--stream-weights` and `--expert-slots 0`) automatically uploads compatible pinned expert tensors directly, reuses any required weight staging and uploads admitted next-layer expert banks on a worker. No additional switches are needed. Other backends, CPU execution, non-streamed weights and route-driven expert slots keep their existing paths.
@@ -371,7 +417,7 @@ A separate matched Nsight pair did establish the intended scheduling change: H2D
 
 #### Large-batch local results (T1000)
 
-The portable numeric record is [layered-prefill-results.json](layered-prefill-results.json). It includes settings, model revisions, the exact synthetic prompt recipe and checksum, run order, rejected cases, timing units and validation limitations. It deliberately excludes raw profiler metadata and machine-specific artifact paths. The top-level environment and sweeps describe the T1000; the separate `rtx3070_direct_upload_comparison` records the current RTX 3070 results: 682.492 tokens/s for 35B and 267.956 tokens/s for 122B, averaged over two direct-upload runs per model at microbatch 1024. See [Automatic CUDA weight staging](#automatic-cuda-weight-staging) for the paired staged/direct comparison and its limitations.
+The portable numeric record is [layered-prefill-results.json](layered-prefill-results.json). It includes settings, model revisions, the exact synthetic prompt recipe and checksum, run order, rejected cases, timing units and validation limitations. It deliberately excludes raw profiler metadata and machine-specific artifact paths. The top-level environment and sweeps describe the T1000; the separate `rtx3070_direct_upload_comparison` preserves the historical RTX 3070 results: 682.492 tokens/s for 35B and 267.956 tokens/s for 122B, averaged over two direct-upload runs per model at microbatch 1024. See [Automatic CUDA weight staging](#automatic-cuda-weight-staging) for the paired staged/direct comparison and its limitations. The latest RTX 3070 length sweep is recorded below and in `rtx3070_latest_length_comparison`.
 
 With 4096 tokens, F32 staging, Flash Attention, host-resident Q4_K_M weights and the limits above, the complete-bank sweep with prefetch requested measured:
 
@@ -390,6 +436,25 @@ The 122B logs report zero accepted and 47 skipped next-layer expert prefetches; 
 At the same 35B microbatch 2048, no-prefetch complete loading measured 99.059 tokens/s, synchronous demand loading 100.946, and asynchronous demand loading 83.588. A complete-bank/prefetch repeat measured 106.685. All four comparisons produced identical final logits relative to the sweep reference (NMSE zero). An earlier isolated complete-bank/prefetch pilot reached 124.344; do not substitute that peak for the sustained sweep/repeat results.
 
 Complete loading uploaded 19461570560 expert bytes; demand loading uploaded 17346265088, about 10.9% fewer. Both uploaded 1585932800 static layer-weight bytes. At this large microbatch a 256-slot demand bank has essentially the same current-layer capacity as a complete bank, unlike the earlier 64-slot/microbatch-8 experiment.
+
+#### Latest RTX 3070 length sweep and T1000 retest
+
+The 2026-10-25 comparison uses the latest mask fast path, batch/cache plan replay and parallel mask filling on an RTX 3070 8 GB with a Xeon Platinum 8268, 128 GB host RAM and 24 inference/batch threads. Both models use the same Q4_K_M revisions recorded above, F16 KV, F32 activation staging, Flash Attention, CPU-resident streamed weights and microbatch capacity 2048. Each point is a separate process with no prefix reuse and zero generated tokens. Throughput uses unprofiled prefill wall time, including prefill weight transfers and cleanup but excluding initial model loading and context creation.
+
+| Actual input tokens | RTX 3070: 35B-A3B tokens/s | RTX 3070: 122B-A10B tokens/s | T1000: 35B-A3B tokens/s | T1000: 122B-A10B tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 332.417 | 104.162 | Pending | Pending |
+| 4096 | 1031.532 | 333.212 | 102.201 (historical) | 15.242 (historical, microbatch 512) |
+| 32000 | 1678.657 | 754.624 | Pending | Pending |
+| 128000 | 1125.669 | 575.407 | Pending | Pending |
+
+The T1000 has not been retested with this code. Its two 4096-token entries are references from the earlier sweep, not matched measurements: CPU, software revision, prompt length before truncation, microbatch and memory budgets differ. Do not interpret these columns as isolated GPU speedup ratios. All four T1000 lengths remain pending a new run; a rejected case must be recorded as a rejection, not zero throughput or an unreported change of settings.
+
+The latest prompt uses the top-level numeric record's two paragraphs and CRLF recipe repeated 3000 times instead of 48, producing 2346002 bytes with SHA-256 `90686fed49f25a9811599ac20a6bc98e3b6fd6a14f9974085db181d33feb50ad`. Each model tokenizes this file and truncates to the exact input count; 32000/128000 are not 32768/131072. Context capacity is `max(input_tokens + 64, 2048)` and logical batch capacity is `max(input_tokens, 2048)`. The 1024-token runs therefore use `-c 2048 -b 2048 -ub 2048`, but process only 1024 tokens in one microbatch; the capacities are not extra input or padding tokens.
+
+The RTX 3070 uses 6144 MiB accounted device budget, 256 MiB static budget, 2048 MiB transfer budget and 128 MiB headroom. Compute/group budgets are 2048/1536 MiB for 35B and 4096/3584 MiB for 122B. CUDA Graph capture remains disabled. Do not copy the 6144 MiB budget to a 4 GB T1000; use its actual available VRAM and record any budget, microbatch or KV precision differences explicitly.
+
+Each length has one measurement, not confidence bounds. All eight saved final-token logits arrays have 248320 finite F32 values; this does not establish equality against an older executable or quality across a corpus. The earlier RTX 3070 direct-upload and T1000 measurements remain preserved separately.
 
 ### GPU activity timeline and overlap
 

@@ -225,6 +225,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # TODO: after `test-llama-archs` is refactored to not link internal symbols, we can move all related tests out of
     #       this branch and run them on all platforms
     llama_build(test-llama-archs.cpp)
+    llama_build_and_test(test-kv-mask.cpp LINK llama)
     llama_test(test-llama-archs NAME test-layered-prefill ARGS --layered-prefill --seed 42)
     llama_test(test-llama-archs NAME test-qwen-prefill ARGS --qwen-prefill --seed 42)
     llama_test(test-llama-archs NAME test-weight-staging ARGS --weight-staging --seed 42)

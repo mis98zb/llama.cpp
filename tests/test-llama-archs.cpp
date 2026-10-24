@@ -805,6 +805,9 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp, &stats) != 0) {
                 throw std::runtime_error("layered prefill failed");
             }
+            if (stats.memory_plan_reuses + 1 != stats.groups.size()) {
+                throw std::runtime_error("layered prefill did not reuse its batch memory plan");
+            }
             const size_t nv = llama_vocab_n_tokens(llama_model_get_vocab(reference.first.get()));
             std::vector<float> expected(logits.end() - nv, logits.end());
             std::vector<float> actual(llama_get_logits(layered.get()), llama_get_logits(layered.get()) + nv);

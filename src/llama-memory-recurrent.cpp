@@ -1317,6 +1317,11 @@ llama_memory_recurrent_context::llama_memory_recurrent_context(
 
 llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 
+void llama_memory_recurrent_context::rewind() {
+    GGML_ASSERT(status == LLAMA_MEMORY_STATUS_SUCCESS && !ubatches.empty());
+    i_next = 0;
+}
+
 bool llama_memory_recurrent_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 

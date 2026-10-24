@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-kv-mask.h"
 
 #include <algorithm>
 #include <cassert>
@@ -387,6 +388,8 @@ llama_kv_cache::llama_kv_cache(
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
+
+llama_kv_cache::~llama_kv_cache() = default;
 
 llama_kv_cache::metadata llama_kv_cache::snapshot_metadata() const {
     return {this, v_cells, v_heads, seq_to_stream, sc_info};
@@ -1770,15 +1773,23 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 }
 
 template<typename T>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data, bool causal_attn) {
+static uint32_t set_input_kq_mask_impl(
+        const args_set_input_kq_mask & args, T * data, bool causal_attn, llama_kv_mask_threadpool * pool) {
+    if (causal_attn && !args.hparams.use_alibi && args.swa_type == LLAMA_SWA_TYPE_NONE && args.n_stream == 1 &&
+        llama_kv_mask_contiguous(args.v_cells.at(args.seq_to_stream[args.ubatch->seq_id[0][0]]),
+            *args.ubatch, args.n_kv, data, llama_cast<T>(0.0f), llama_cast<T>(-INFINITY), pool)) {
+        return pool ? pool->n_threads_used : 1;
+    }
     if (causal_attn) {
         set_input_kq_mask_impl<T, true> (args, data);
     } else {
         set_input_kq_mask_impl<T, false>(args, data);
     }
+    return 1;
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(
+        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int32_t n_threads) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1797,7 +1808,14 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
     }
 
-    //const int64_t t_start = ggml_time_us();
+    const int64_t t_start = ggml_time_us();
+    llama_kv_mask_threadpool * pool = nullptr;
+    if (n_threads > 1 && ggml_nbytes(dst) >= (8u << 20)) {
+        if (!mask_pool || mask_pool->n_threads_max != uint32_t(n_threads)) {
+            mask_pool = std::make_unique<llama_kv_mask_threadpool>(n_threads);
+        }
+        pool = mask_pool.get();
+    }
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -1811,15 +1829,16 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_tps            =*/ n_tps,
     };
 
+    uint32_t used;
     if (dst->type == GGML_TYPE_F16) {
-        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+        used = set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn, pool);
     } else {
-        set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+        used = set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn, pool);
     }
-
-    //const int64_t t_end = ggml_time_us();
-
-    //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+    mask_timing.time_us += ggml_time_us() - t_start;
+    ++mask_timing.calls;
+    mask_timing.parallel_calls += used > 1;
+    mask_timing.max_threads = std::max(mask_timing.max_threads, used);
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2869,6 +2888,12 @@ llama_kv_cache_context::llama_kv_cache_context(
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
 
+void llama_kv_cache_context::rewind() {
+    GGML_ASSERT(status == LLAMA_MEMORY_STATUS_SUCCESS && !ubatches.empty());
+    i_cur = 0;
+    n_kv = 0;
+}
+
 bool llama_kv_cache_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
@@ -2961,8 +2986,9 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
-void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+void llama_kv_cache_context::set_input_kq_mask(
+        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int32_t n_threads) const {
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, n_threads);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

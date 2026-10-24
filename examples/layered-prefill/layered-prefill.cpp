@@ -292,6 +292,13 @@ int main(int argc, char ** argv) {
                         prefill_ms, stats.evaluated_tokens, stats.evaluated_tokens * 1000.0 / prefill_ms);
                 LOG_INF("phase ms: weight-load=%.3f, graph-setup=%.3f, compute-wait=%.3f, activation-copy=%.3f\n",
                         stats.weight_load_ms, stats.graph_setup_ms, stats.compute_wait_ms, stats.activation_copy_ms);
+                LOG_INF("preparation ms: metadata-restore=%.3f, batch-init=%.3f, memory-init=%.3f, plan-reuses=%u\n",
+                        stats.metadata_restore_ms, stats.batch_init_ms, stats.memory_init_ms, stats.memory_plan_reuses);
+                LOG_INF("setup detail ms: memory-apply=%.3f, graph-build=%.3f, graph-reserve=%.3f, graph-alloc=%.3f, inputs=%.3f, input-wait=%.3f, prefetch=%.3f\n",
+                        stats.memory_apply_ms, stats.graph_build_ms, stats.graph_reserve_ms, stats.graph_alloc_ms,
+                        stats.graph_inputs_ms, stats.input_wait_ms, stats.prefetch_setup_ms);
+                LOG_INF("mask: %.3f ms within inputs, calls=%" PRIu64 ", parallel=%" PRIu64 ", max threads=%u\n",
+                        stats.mask_ms, stats.mask_calls, stats.mask_parallel_calls, stats.mask_max_threads);
                 LOG_INF("reused prefix=%u tokens, evaluated suffix=%u tokens, capacity-only plan=%d\n",
                         stats.reused_prefix_tokens, stats.evaluated_tokens, stats.capacity_only);
                 LOG_INF("single in-place activation buffer: host bytes=%zu, pinned bytes=%zu\n",

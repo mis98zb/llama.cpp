@@ -582,6 +582,17 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
 
 llama_memory_hybrid_idx_context::~llama_memory_hybrid_idx_context() = default;
 
+void llama_memory_hybrid_idx_context::rewind() {
+    llama_memory_hybrid_context::rewind();
+    if (ctx_idx) {
+        static_cast<llama_kv_cache_context *>(ctx_idx.get())->rewind();
+    }
+    i_cur = 0;
+    i_kpool = SIZE_MAX;
+    kpool_st.reset();
+    mem_idx_stale_batch = mem->mem_idx_stale_get();
+}
+
 bool llama_memory_hybrid_idx_context::next() {
     // Clear only after a successful ubatch.
     if (i_cur == 0 && mem != nullptr) {

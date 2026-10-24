@@ -182,6 +182,8 @@ public:
     // llama_memory_recurrent_context specific API
     //
 
+    void rewind();
+
     uint32_t get_n_rs() const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;

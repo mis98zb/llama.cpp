@@ -1327,6 +1327,8 @@ int llama_context::prefill_layered_run(
         llama_prefill_probe * probe) {
     const auto & hp = model.hparams;
     const bool pipelined = params.pipeline && device != backend_cpu;
+    auto * mask_cache = static_cast<llama_memory_hybrid *>(memory.get())->get_mem_attn();
+    mask_cache->reset_mask_stats();
 
     llama_layered_prefill_stats stats;
     stats.selected_ubatch = params.n_ubatch;
@@ -1420,6 +1422,7 @@ int llama_context::prefill_layered_run(
             throw llama_prefill_resource_error("failed to reserve layered prefill logits");
         }
         started = true;
+        llama_memory_context_ptr mctx;
         for (size_t i_group = 0; i_group < groups.size(); ++i_group) {
             const auto & group = groups[i_group];
             const uint32_t il = group.first_layer;
@@ -1427,14 +1430,31 @@ int llama_context::prefill_layered_run(
             prefill_profile_range layer_range(profile.get(), "llama.layer", int(il));
             ggml_backend_sched_reset(sched.get());
             gf_res_prev_active = nullptr;
+            const int64_t restore_start = ggml_time_us();
+            prefill_profile_range restore_range(profile.get(), "llama.metadata-restore", int(il));
             restore_metadata();
-            if (!balloc->init(batch, model.vocab, false)) {
+            restore_range.close();
+            const int64_t batch_start = ggml_time_us();
+            stats.metadata_restore_ms += (batch_start - restore_start) * 1e-3;
+            prefill_profile_range batch_range(profile.get(), "llama.batch-init", int(il));
+            if (i_group == 0 && !balloc->init(batch, model.vocab, false)) {
                 throw std::runtime_error("failed to initialize layered prefill batch");
             }
-            auto mctx = memory->init_batch(*balloc, params.n_ubatch, false);
+            batch_range.close();
+            const int64_t memory_start = ggml_time_us();
+            stats.batch_init_ms += (memory_start - batch_start) * 1e-3;
+            prefill_profile_range memory_range(profile.get(), "llama.memory-init", int(il));
+            if (i_group == 0) {
+                mctx = memory->init_batch(*balloc, params.n_ubatch, false);
+            } else {
+                static_cast<llama_memory_hybrid_context *>(mctx.get())->rewind();
+                ++stats.memory_plan_reuses;
+            }
             if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
                 throw std::runtime_error("failed to prepare layered prefill memory");
             }
+            memory_range.close();
+            stats.memory_init_ms += (ggml_time_us() - memory_start) * 1e-3;
             size_t group_bytes = 0;
             for (uint32_t lid = il; lid < last; ++lid) {
                 if (model.layers[lid].ffn_gate_exps || model.layers[lid].ffn_gate_up_exps) {
@@ -1598,10 +1618,15 @@ int llama_context::prefill_layered_run(
                 }
                 const int64_t prepare_start = ggml_time_us();
                 prefill_profile_range setup_range(profile.get(), "llama.setup", int(il), int(i_batch));
+                prefill_profile_range apply_range(profile.get(), "llama.memory-apply", int(il), int(i_batch));
                 if (!mctx->apply()) {
                     throw std::runtime_error("failed to apply layered prefill memory");
                 }
                 const int64_t prepare_end = ggml_time_us();
+                apply_range.close();
+                stats.memory_apply_ms += (prepare_end - prepare_start) * 1e-3;
+                const int64_t build_start = ggml_time_us();
+                prefill_profile_range build_range(profile.get(), "llama.graph-build", int(il), int(i_batch));
                 n_outputs = last == hp.n_layer() && offset + ubatch.n_tokens == (size_t) n_tokens ? 1 : 0;
                 auto * res = get_gf_res_prev();
                 ggml_backend_sched_reset(sched.get());
@@ -1655,6 +1680,10 @@ int llama_context::prefill_layered_run(
                     throw std::runtime_error("failed to build layered prefill graph");
                 }
                 prefill_place_staging(sched.get(), gf, device, *res);
+                build_range.close();
+                const int64_t reserve_start = ggml_time_us();
+                stats.graph_build_ms += (reserve_start - build_start) * 1e-3;
+                prefill_profile_range reserve_range(profile.get(), "llama.graph-reserve", int(il), int(i_batch));
                 std::vector<size_t> sizes(backend_ptrs.size());
                 ggml_backend_sched_reserve_size(sched.get(), gf, sizes.data());
                 prefill_check_graph(sched.get(), gf, weights, device, *res);
@@ -1687,9 +1716,17 @@ int llama_context::prefill_layered_run(
                 stats.peak_compute_bytes = std::max(stats.peak_compute_bytes, compute_bytes);
                 // Splitting a measurement graph rewrites sources to scheduler-owned copies.
                 ggml_backend_sched_reset(sched.get());
+                reserve_range.close();
+                const int64_t rebuild_start = ggml_time_us();
+                stats.graph_reserve_ms += (rebuild_start - reserve_start) * 1e-3;
+                prefill_profile_range rebuild_range(profile.get(), "llama.graph-rebuild", int(il), int(i_batch));
                 res->reset();
                 gf = model.build_graph(gparams);
                 prefill_place_staging(sched.get(), gf, device, *res);
+                rebuild_range.close();
+                const int64_t alloc_start = ggml_time_us();
+                stats.graph_build_ms += (alloc_start - rebuild_start) * 1e-3;
+                prefill_profile_range alloc_range(profile.get(), "llama.graph-alloc", int(il), int(i_batch));
                 if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                     throw llama_prefill_resource_error("failed to allocate layered prefill graph");
                 }
@@ -1697,9 +1734,15 @@ int llama_context::prefill_layered_run(
                     backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
                 }
                 prefill_check_graph(sched.get(), gf, weights, device, *res);
+                alloc_range.close();
                 const int64_t inputs_start = ggml_time_us();
+                stats.graph_alloc_ms += (inputs_start - alloc_start) * 1e-3;
+                prefill_profile_range inputs_range(profile.get(), "llama.inputs", int(il), int(i_batch));
                 res->set_inputs(&ubatch);
+                inputs_range.close();
                 const int64_t inputs_end = ggml_time_us();
+                stats.graph_inputs_ms += (inputs_end - inputs_start) * 1e-3;
+                prefill_profile_range input_wait_range(profile.get(), "llama.input-wait", int(il), int(i_batch));
                 const size_t bytes = row_bytes * ubatch.n_tokens;
                 if (res->t_prefill_in) {
                     if (pipeline) {
@@ -1713,6 +1756,10 @@ int llama_context::prefill_layered_run(
                         probe->read_ms += (ggml_time_us() - inputs_end) * 1e-3;
                     }
                 }
+                input_wait_range.close();
+                const int64_t prefetch_start = ggml_time_us();
+                stats.input_wait_ms += (prefetch_start - inputs_end) * 1e-3;
+                prefill_profile_range prefetch_range(profile.get(), "llama.prefetch-setup", int(il), int(i_batch));
                 if (i_batch == 0 && params.weight_prefetch &&
                     !demand && device != backend_cpu && i_group + 1 < groups.size()) {
                     size_t extra_bytes = 0, extra_pinned = 0;
@@ -1791,6 +1838,8 @@ int llama_context::prefill_layered_run(
                     }
                 }
                 const int64_t compute_start = ggml_time_us();
+                prefetch_range.close();
+                stats.prefetch_setup_ms += (compute_start - prefetch_start) * 1e-3;
                 setup_range.close();
                 stats.graph_setup_ms += (compute_start - prepare_start) * 1e-3;
                 computed = true;
@@ -1892,6 +1941,11 @@ int llama_context::prefill_layered_run(
             n_queued_tokens = n_tokens;
         }
         synchronize();
+        const auto mask_after = mask_cache->get_mask_stats();
+        stats.mask_ms = mask_after.time_us * 1e-3;
+        stats.mask_calls = mask_after.calls;
+        stats.mask_parallel_calls = mask_after.parallel_calls;
+        stats.mask_max_threads = mask_after.max_threads;
         if (stats_out) {
             *stats_out = stats;
         }

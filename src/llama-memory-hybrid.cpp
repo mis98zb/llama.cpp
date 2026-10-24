@@ -272,6 +272,13 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
+void llama_memory_hybrid_context::rewind() {
+    GGML_ASSERT(status == LLAMA_MEMORY_STATUS_SUCCESS && !ubatches.empty());
+    i_next = 0;
+    static_cast<llama_kv_cache_context *>(ctx_attn.get())->rewind();
+    static_cast<llama_memory_recurrent_context *>(ctx_recr.get())->rewind();
+}
+
 bool llama_memory_hybrid_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 

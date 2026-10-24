@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -12,6 +13,7 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+class llama_kv_mask_threadpool;
 
 //
 // llama_kv_cache
@@ -128,7 +130,17 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
+
+    struct mask_stats {
+        int64_t time_us = 0;
+        uint64_t calls = 0;
+        uint64_t parallel_calls = 0;
+        uint32_t max_threads = 1;
+    };
+
+    mask_stats get_mask_stats() const { return mask_timing; }
+    void reset_mask_stats() const { mask_timing = {}; }
 
     //
     // llama_memory_i
@@ -245,7 +257,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int32_t n_threads = 1) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -329,6 +341,9 @@ private:
 
     std::vector<kv_layer> layers;
 
+    mutable std::unique_ptr<llama_kv_mask_threadpool> mask_pool;
+    mutable mask_stats mask_timing;
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
@@ -410,6 +425,9 @@ public:
     // llama_kv_cache_context specific API
     //
 
+    // Reuse a batch plan after the caller restores the cache metadata.
+    void rewind();
+
     uint32_t get_n_kv() const;
 
     ggml_type type_k() const;
@@ -441,7 +459,7 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int32_t n_threads = 1) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

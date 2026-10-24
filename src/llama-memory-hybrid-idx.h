@@ -189,6 +189,8 @@ public:
     // llama_memory_hybrid_idx_context specific API
     //
 
+    void rewind() override;
+
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
 

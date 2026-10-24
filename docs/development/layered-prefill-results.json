@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "experiment_dates": ["2026-10-21", "2026-10-22"],
+  "experiment_dates": ["2026-10-21", "2026-10-22", "2026-10-25"],
   "scope": "Local experimental layer-major Qwen3.5 MoE prefill; measurements are not portable GPU performance claims.",
   "implementation_base_commit": "a2005cf9c29135090bf051661fd7eb3fd66f8ffd",
   "environment": {
@@ -413,6 +413,105 @@
       "Do not compare these means directly with older runs performed under different conditions.",
       "Direct expert uploads do not remove the approximately 71 GiB resident pinned 122B model or reduce expert H2D payload.",
       "Raw logs and logits remain local; machine-specific artifact paths are not included."
+    ]
+  },
+  "rtx3070_latest_length_comparison": {
+    "recorded_date": "2026-10-25",
+    "scope": "Latest RTX 3070 length sweep; historical T1000 entries are not matched GPU comparisons. T1000 retesting is pending.",
+    "source_base_commit": "f07b1ae4661d6797f767a11c7e426e913a8bcf54",
+    "source_dirty": true,
+    "executable_sha256": "569d701326122810e44a23ae26d87a123e3f77dc5f21c2698506abc5cbdbc1eb",
+    "optimizations": ["contiguous causal mask fast path", "batch/cache plan replay", "parallel mask filling"],
+    "environment": {
+      "os": "Windows",
+      "cpu": "Intel Xeon Platinum 8268",
+      "host_ram_gib": 128,
+      "gpu": "NVIDIA GeForce RTX 3070 8 GB",
+      "cuda_architecture": 86,
+      "cuda_toolkit": "12.6",
+      "cuda_build_msvc": "14.44",
+      "cpu_threads": 24,
+      "cpu_batch_threads": 24,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0,
+      "cuda_graphs_disabled": true
+    },
+    "models_reference": "models",
+    "prompt": {
+      "description": "Same top-level paragraphs and CRLF recipe, repeated 3000 times instead of 48; tokenize and truncate to each exact input length.",
+      "paragraphs_reference": "prompt.paragraphs",
+      "repetitions": 3000,
+      "file_bytes": 2346002,
+      "encoding": "UTF-8 without BOM",
+      "sha256": "90686fed49f25a9811599ac20a6bc98e3b6fd6a14f9974085db181d33feb50ad"
+    },
+    "settings": {
+      "input_tokens": [1024, 4096, 32000, 128000],
+      "context_tokens": "max(input_tokens + 64, 2048)",
+      "logical_batch": "max(input_tokens, 2048)",
+      "microbatch_capacity": 2048,
+      "actual_microbatch_tokens": "min(remaining_input_tokens, 2048)",
+      "generated_tokens": 0,
+      "reused_prefix_tokens": 0,
+      "kv_type_k": "F16",
+      "kv_type_v": "F16",
+      "activation_staging": "F32",
+      "flash_attention": true,
+      "stream_weights": true,
+      "load_mode": "none",
+      "expert_slots": 0,
+      "weight_prefetch": true,
+      "merge_gate_up": false,
+      "defer_static_upload": false,
+      "static_budget_mib": 256,
+      "transfer_budget_mib": 2048,
+      "accounted_device_budget_mib": 6144,
+      "device_headroom_mib": 128,
+      "compute_budget_mib": {"35b": 2048, "122b": 4096},
+      "group_budget_mib": {"35b": 1536, "122b": 3584},
+      "timing": "Unprofiled prefill wall, including prefill weight transfers and cleanup, excluding initial model loading and context creation.",
+      "samples_per_point": 1,
+      "execution": "Serial separate processes; original 4096/32000/128000 sweep first, supplemental 1024 runs afterwards."
+    },
+    "runs": [
+      {"model": "35b", "input_tokens": 1024, "wall_ms": 3080.468, "tokens_per_second": 332.417},
+      {"model": "35b", "input_tokens": 4096, "wall_ms": 3970.793, "tokens_per_second": 1031.532},
+      {"model": "35b", "input_tokens": 32000, "wall_ms": 19062.859, "tokens_per_second": 1678.657},
+      {"model": "35b", "input_tokens": 128000, "wall_ms": 113710.179, "tokens_per_second": 1125.669},
+      {"model": "122b", "input_tokens": 1024, "wall_ms": 9830.811, "tokens_per_second": 104.162},
+      {"model": "122b", "input_tokens": 4096, "wall_ms": 12292.484, "tokens_per_second": 333.212},
+      {"model": "122b", "input_tokens": 32000, "wall_ms": 42405.226, "tokens_per_second": 754.624},
+      {"model": "122b", "input_tokens": 128000, "wall_ms": 222451.243, "tokens_per_second": 575.407}
+    ],
+    "historical_t1000_4096_reference": {
+      "source": "large_complete_bank_sweeps",
+      "matched_configuration": false,
+      "35b": {"microbatch": 2048, "tokens_per_second": 102.201},
+      "122b": {"microbatch": 512, "tokens_per_second": 15.242},
+      "caveat": "CPU, software, prompt construction, budgets and microbatch differ; do not treat ratios as isolated GPU speedups."
+    },
+    "t1000_retest": {
+      "status": "pending",
+      "models": ["35b", "122b"],
+      "input_tokens": [1024, 4096, 32000, 128000],
+      "runs": [],
+      "budget_policy": "Use actual available VRAM; do not copy the RTX 3070 6144 MiB cap. Record configuration differences and rejected cases explicitly."
+    },
+    "validation": {
+      "successful_exact_token_runs": 8,
+      "final_logits_values_per_run": 248320,
+      "final_logits_type": "F32",
+      "all_final_logits_finite": true,
+      "same_executable_across_all_runs": true
+    },
+    "limitations": [
+      "One measured sample per model and length, not confidence bounds.",
+      "The 1024-token runs use 2048-token context and batch capacities to retain the requested microbatch capacity; only 1024 tokens are evaluated.",
+      "An initial 35B -c 1088 -b 1024 -ub 2048 attempt was rejected before prefill because context construction clamps microbatch capacity; it is not a timing measurement.",
+      "Historical T1000 records are retained, but no latest-code T1000 results are claimed.",
+      "No old same-shape logits comparison or corpus quality measurement was performed for this eight-point sweep.",
+      "Exact 32000/128000 input counts differ from 32768/131072 used by some external benchmarks.",
+      "Raw logs, full commands and final logits remain local; machine-specific artifact paths are excluded."
     ]
   },
   "conclusions": [

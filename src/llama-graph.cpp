@@ -1151,7 +1151,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
         mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn,
+            ubatch->n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads);
 
         if (inp_attn->self_k_rot) {
             mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1176,7 +1177,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
-    if (!inp_attn || !inp_rs) {
+    if (!inp_attn || !inp_rs ||
+        cparams.n_threads != params.cparams.n_threads || cparams.n_threads_batch != params.cparams.n_threads_batch) {
         return false;
     }
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
@@ -1206,7 +1208,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     if (inp_attn) {
         mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn,
+            ubatch->n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1223,7 +1226,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
-    if (!inp_attn || !inp_rs) {
+    if (!inp_attn || !inp_rs ||
+        cparams.n_threads != params.cparams.n_threads || cparams.n_threads_batch != params.cparams.n_threads_batch) {
         return false;
     }
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
