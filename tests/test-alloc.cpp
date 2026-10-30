@@ -581,6 +581,31 @@ static void test_multiple_buffer_types() {
     GGML_ASSERT(backend_b.context->allocated_total() <= 32 + 24);
 }
 
+static void test_scheduler_graph_boundaries() {
+    for (bool boundaries : {false, true}) {
+        dummy_backend backend = dummy_backend_init(SIZE_MAX);
+        auto [ctx, graph, ctx_ptr] = make_context();
+        auto * input = make_input_with_size(ctx, 64);
+        auto * a = ggml_scale(ctx, input, 2.0f);
+        auto * b = ggml_scale(ctx, a, 3.0f);
+        auto * c = ggml_add(ctx, a, b);
+        if (boundaries) {
+            a->flags |= GGML_TENSOR_FLAG_GRAPH_BOUNDARY;
+            b->flags |= GGML_TENSOR_FLAG_GRAPH_BOUNDARY;
+            c->flags |= GGML_TENSOR_FLAG_GRAPH_BOUNDARY;
+        }
+        ggml_set_output(c);
+        ggml_build_forward_expand(graph, c);
+        ggml_backend_t backends[] = {&backend.context->backend};
+        ggml_backend_buffer_type_t bufts[] = {&backend.buffer_type};
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 1, 256, false, true));
+        GGML_ASSERT(sched && ggml_backend_sched_alloc_graph(sched.get(), graph));
+        GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == (boundaries ? 3 : 1));
+        check_all_allocated(graph);
+        check_no_overlap(graph);
+    }
+}
+
 static void test_buffer_size_zero() {
     dummy_backend backend_a    = dummy_backend_init(SIZE_MAX);
     dummy_backend backend_b    = dummy_backend_init(SIZE_MAX);
@@ -1140,6 +1165,7 @@ int main() {
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
+    run("test_scheduler_graph_boundaries", test_scheduler_graph_boundaries);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
