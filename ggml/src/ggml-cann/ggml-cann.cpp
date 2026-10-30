@@ -2664,6 +2664,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                if (op->src[5]) {
+                    return false;
+                }
 #ifdef ASCEND_310P
                 // FA not support on 310p device
                 return false;

@@ -8513,6 +8513,53 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_flash_attn_indices : public test_flash_attn_ext {
+    bool empty_query;
+
+    test_flash_attn_indices(int64_t kv, int64_t nb, int64_t streams, bool sinks, bool empty_query = false)
+        : test_flash_attn_ext(512, 512, 1, {8, streams}, kv, nb, true, sinks, 0.0f, 0.0f,
+            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 32),
+          empty_query(empty_query) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",direct_indices=1,empty_query=" + std::to_string(empty_query);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * out = test_flash_attn_ext::build_graph(ctx);
+        auto * indices = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv_max, nb, 1, nr23[1]);
+        ggml_set_name(indices, "indices");
+        ggml_flash_attn_ext_set_indices(out, indices);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        auto * mask = ggml_get_tensor(ctx, "m");
+        auto * indices = ggml_get_tensor(ctx, "indices");
+        std::vector<ggml_fp16_t> values(ggml_nelements(mask));
+        ggml_backend_tensor_get(mask, values.data(), 0, ggml_nbytes(mask));
+        std::vector<int32_t> selected(ggml_nelements(indices), -1);
+        for (int64_t row = 0; row < nb*nr23[1]; ++row) {
+            int64_t count = 0;
+            for (int64_t col = 0; col < kv; ++col) {
+                if (std::isfinite(ggml_fp16_to_fp32(values[row*kv + col]))) {
+                    values[row*kv + col] = ggml_fp32_to_fp16(0.01f*(col % 7));
+                    selected[row*n_kv_max + count++] = col;
+                }
+            }
+            if (count < n_kv_max) {
+                selected[row*n_kv_max + count] = kv + 17;
+            }
+        }
+        if (nb > 1 || empty_query) {
+            std::fill(selected.end() - n_kv_max, selected.end(), -1);
+        }
+        ggml_backend_tensor_set(mask, values.data(), 0, ggml_nbytes(mask));
+        ggml_backend_tensor_set(indices, selected.data(), 0, ggml_nbytes(indices));
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -8952,6 +8999,39 @@ struct test_lightning_indexer : public test_case {
             } else {
                 init_tensor_uniform(t);
             }
+        }
+    }
+};
+
+struct test_lightning_indexer_windows : public test_lightning_indexer {
+    test_lightning_indexer_windows(int64_t batch, int64_t streams)
+        : test_lightning_indexer(128, 32, 256, batch, streams, streams, GGML_TYPE_F16) {}
+
+    std::string vars() override {
+        return test_lightning_indexer::vars() + ",query_window=64";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * reference = test_lightning_indexer::build_graph(ctx);
+        auto * q = reference->src[0];
+        auto * k = reference->src[1];
+        auto * w = reference->src[2];
+        auto * mask = reference->src[3];
+        ggml_tensor * windows = nullptr;
+        for (int64_t begin = 0; begin < nb; begin += 64) {
+            const int64_t count = std::min<int64_t>(64, nb - begin);
+            auto * query = ggml_view_4d(ctx, q, hsk, nh, count, ns, q->nb[1], q->nb[2], q->nb[3], begin*q->nb[2]);
+            auto * weights = ggml_view_4d(ctx, w, nh, count, 1, ns, w->nb[1], w->nb[2], w->nb[3], begin*w->nb[1]);
+            auto * m = ggml_view_4d(ctx, mask, kv, count, 1, ns, mask->nb[1], mask->nb[2], mask->nb[3], begin*mask->nb[1]);
+            auto * scores = ggml_lightning_indexer(ctx, query, k, weights, m);
+            windows = windows ? ggml_concat(ctx, windows, scores, 1) : scores;
+        }
+        return ggml_sub(ctx, reference, windows);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
         }
     }
 };
@@ -12016,7 +12096,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_falcon(2));
 #endif
 
+    for (int64_t kv : {256, 4096}) {
+        for (int64_t batch : {1, 7, 32}) {
+            for (int64_t streams : {1, 2}) {
+                for (bool sinks : {false, true}) {
+                    test_cases.emplace_back(new test_flash_attn_indices(kv, batch, streams, sinks));
+                }
+            }
+        }
+    }
+    for (int64_t streams : {1, 2}) {
+        for (bool sinks : {false, true}) {
+            test_cases.emplace_back(new test_flash_attn_indices(4096, 1, streams, sinks, true));
+        }
+    }
+
     // lightning_indexer
+    for (int64_t queries : {65, 97, 137}) {
+        for (int64_t streams : {1, 2}) {
+            test_cases.emplace_back(new test_lightning_indexer_windows(queries, streams));
+        }
+    }
     for (int kv : { 256 }) {
         for (int bs : { 1, 512 }) {
             for (int nh : { 4, 32, 64 }) {

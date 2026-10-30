@@ -2,6 +2,8 @@
 
 List of GGML operations and backend support status.
 
+`FLASH_ATTN_EXT` optionally accepts unique I32 key indices per query through `ggml_flash_attn_ext_set_indices`. The ordinary mask still applies; negative or out-of-range indices are ignored. CPU has a reference implementation. NVIDIA CUDA supports F16 K/V with head dimensions 512/512, aligned/padded GQA with a head ratio divisible by eight, zero ALiBi and no softcap. Other backends reject this optional input and retain their existing mask-based behavior. CUDA reuses its sparse attention kernels and compacts only the supplied indices, rather than scanning a dense selection mask.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)

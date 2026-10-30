@@ -1626,6 +1626,9 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const ggml_tensor * op) override {
+        if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+            return nullptr;
+        }
         switch (op->op) {
             case GGML_OP_MUL_MAT:
             case GGML_OP_MUL_MAT_ID:

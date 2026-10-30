@@ -1,4 +1,5 @@
 "backend_name","op_name","op_params","test_mode","supported","error_message","backend_reg_name"
+"CUDA0","FLASH_ATTN_EXT","hsk=512,hsv=512,nh=1,nr23=[8,1],kv=4096,nb=32,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=f16,type_V=f16,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=1,n_kv_max=32,direct_indices=1,empty_query=0","support","1","yes","CUDA"
 "CUDA0","ABS","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
 "CUDA0","ABS","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
 "CUDA0","SGN","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"

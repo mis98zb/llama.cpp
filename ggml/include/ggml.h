@@ -2499,6 +2499,10 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // Optional unique key indices per query: I32 [n_selected, n_batch, 1, ne3].
+    // Out-of-range indices are ignored. The ordinary mask still controls visibility and bias.
+    GGML_API void ggml_flash_attn_ext_set_indices(struct ggml_tensor * a, struct ggml_tensor * indices);
+
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec),

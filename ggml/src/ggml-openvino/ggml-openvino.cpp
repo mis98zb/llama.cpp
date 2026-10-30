@@ -1498,6 +1498,9 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_FLASH_ATTN_EXT: {
+        if (op->src[5]) {
+            return false;
+        }
         float scale = 1.0f;
         float max_bias = 0.0f;
         float logit_softcap = 0.0f;

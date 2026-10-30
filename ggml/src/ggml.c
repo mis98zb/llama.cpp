@@ -5561,6 +5561,16 @@ struct ggml_tensor * ggml_flash_attn_ext(
 }
 
 
+void ggml_flash_attn_ext_set_indices(struct ggml_tensor * a, struct ggml_tensor * indices) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(indices && indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices));
+    GGML_ASSERT(indices->ne[0] > 0 && indices->ne[0] <= INT32_MAX);
+    GGML_ASSERT(indices->ne[1] == a->src[0]->ne[1] && indices->ne[2] == 1);
+    GGML_ASSERT(indices->ne[3] == a->src[0]->ne[3]);
+    a->src[5] = indices;
+    ggml_flash_attn_ext_set_n_kv_max(a, (int32_t) indices->ne[0]);
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
