@@ -63,6 +63,8 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             pp.staging_type = std::strcmp(argv[i], "bf16") == 0 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+        } else if (std::strcmp(argv[i], "--full-layers") == 0) {
+            pp.full_layers = true;
         } else if (std::strcmp(argv[i], "--no-pipeline") == 0) {
             pp.pipeline = false;
         } else if (std::strcmp(argv[i], "--no-weight-prefetch") == 0) {
@@ -113,6 +115,8 @@ int main(int argc, char ** argv) {
                     pp.max_host_bytes = bytes;
                 } else if (std::strcmp(option, "--compute-budget-mib") == 0) {
                     pp.max_compute_bytes = bytes;
+                } else if (std::strcmp(option, "--transfer-budget-mib") == 0) {
+                    pp.max_transfer_bytes = bytes;
                 } else if (std::strcmp(option, "--prefetch-budget-mib") == 0) {
                     pp.max_prefetch_bytes = bytes;
                 } else if (std::strcmp(option, "--prefetch-headroom-mib") == 0 ||
@@ -132,8 +136,6 @@ int main(int argc, char ** argv) {
                     pp.expert_slots = bytes;
                 } else if (std::strcmp(option, "--static-budget-mib") == 0) {
                     pp.max_static_bytes = bytes;
-                } else if (std::strcmp(option, "--transfer-budget-mib") == 0) {
-                    pp.max_transfer_bytes = bytes;
                 } else if (std::strcmp(option, "--device-budget-mib") == 0) {
                     pp.max_device_bytes = bytes;
                 } else if (std::strcmp(option, "--prompt-tokens") == 0) {
@@ -158,9 +160,10 @@ int main(int argc, char ** argv) {
     common_args.push_back(nullptr);
     if (!common_params_parse(common_argc, common_args.data(), params, LLAMA_EXAMPLE_COMMON,
                             [](int, char **) {
-                                LOG("Layered prefill: --staging-type bf16|f32, --no-pipeline, --no-weight-prefetch\n");
+                                LOG("Layered prefill: --staging-type bf16|f32, --no-pipeline, --no-weight-prefetch, --full-layers\n");
                                 LOG("Memory: --compute-budget-mib N, --prefetch-budget-mib N, --prefetch-headroom-mib N\n");
                                 LOG("Host activation and pinned weight staging limit: --host-budget-mib N\n");
+                                LOG("Transfers: --transfer-budget-mib N (0 sizes full-layer transfers automatically)\n");
                                 LOG("Planner: --auto-plan, --group-layers N, --max-group-layers N, --max-prefetch-layers N\n");
                                 LOG("Planner limits: --group-budget-mib N, --calibration-ms N\n");
                                 LOG("Resident safety margin: --device-headroom-mib N (alias of --prefetch-headroom-mib)\n");
@@ -204,6 +207,13 @@ int main(int argc, char ** argv) {
     int exit_status = 0;
     try {
         auto mp = common_model_params_to_llama(params);
+        if (pp.full_layers) {
+            mp.n_gpu_layers = 0;
+            params.no_kv_offload = true;
+            params.no_op_offload = true;
+            pp.weight_prefetch = false;
+            mp.use_extra_bufts = false;
+        }
         std::vector<llama_model_tensor_buft_override> overrides = {
             { pp.stream_weights ? ".*" : LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() },
         };
@@ -301,6 +311,21 @@ int main(int argc, char ** argv) {
                         stats.mask_ms, stats.mask_calls, stats.mask_parallel_calls, stats.mask_max_threads);
                 LOG_INF("reused prefix=%u tokens, evaluated suffix=%u tokens, capacity-only plan=%d\n",
                         stats.reused_prefix_tokens, stats.evaluated_tokens, stats.capacity_only);
+                if (pp.full_layers) {
+                    LOG_INF("full-layer weights=%" PRIu64 ", state upload/download=%" PRIu64 "/%" PRIu64 ", peak bank=%zu\n",
+                            stats.layer_weight_bytes, stats.state_upload_bytes, stats.state_download_bytes, stats.peak_layer_bytes);
+                    const auto & t = stats.timing;
+                    LOG_INF("full-layer wall ms: execution=%.3f setup=%.3f memory=%.3f weights=%.3f state-up=%.3f state-down=%.3f graph=%.3f inputs=%.3f activation-up=%.3f compute/wait=%.3f activation-down=%.3f output=%.3f cleanup=%.3f other=%.3f\n",
+                            t.total_ms, t.setup_ms, t.memory_ms, t.weight_ms, t.state_upload_ms, t.state_download_ms,
+                            t.graph_ms, t.inputs_ms, t.activation_upload_ms, t.compute_ms, t.activation_download_ms,
+                            t.output_ms, t.cleanup_ms, t.total_ms - t.accounted_ms());
+                }
+                LOG_INF("prefill graphs: builds=%u reused=%u measurements=%u f16-indexer=%d compact-attention=%d\n",
+                        stats.graph_builds, stats.graph_reuses, stats.graph_measurements,
+                        stats.f16_indexer_active, stats.compact_attention_active);
+                LOG_INF("prefill workspace: reserved=%zu reserve=%.3f ms backend-segments=%u indexer-window=%u causal-positions=%d pool-ranges=%d\n",
+                        stats.reserved_workspace_bytes, stats.timing.workspace_reserve_ms, stats.max_backend_segments,
+                        stats.max_indexer_queries, stats.compact_causal_input, stats.compact_pool_input);
                 LOG_INF("single in-place activation buffer: host bytes=%zu, pinned bytes=%zu\n",
                         stats.activation_host_bytes, stats.activation_pinned_bytes);
                 LOG_INF("expert layer loads=%u, copied bytes=%" PRIu64 ", activation read/write=%" PRIu64 "/%" PRIu64
@@ -330,13 +355,13 @@ int main(int argc, char ** argv) {
                         stats.weight_prefetches, stats.weight_prefetch_skips, stats.weight_prefetch_allocation_attempts,
                         stats.prefetched_expert_bytes, stats.weight_prefetch_submit_bytes,
                         stats.peak_prefetch_bytes, stats.prefetch_pinned_bytes);
-                LOG_INF("selected batch=%u, groups=%zu, planner alternatives=%u, probes=%u, profile reused=%d, planning=%.2f ms\n",
+                LOG_INF("selected batch=%u, groups=%zu, planner alternatives=%u, dry graphs=%u, probes=%u, profile reused=%d, planning=%.2f ms\n",
                         stats.selected_ubatch, stats.groups.size(), stats.planner_candidates,
-                        stats.calibration_probes, stats.profile_reused, stats.planning_ms);
+                        stats.planner_graphs, stats.calibration_probes, stats.profile_reused, stats.planning_ms);
                 for (const auto & group : stats.groups) {
-                    LOG_INF("layers [%u,%u): prefetch=%u, experts=%zu, scheduler=%zu\n",
+                    LOG_INF("layers [%u,%u): prefetch=%u, weights=%zu, state=%zu, scheduler=%zu\n",
                             group.first_layer, group.first_layer + group.n_layers, group.n_prefetch_layers,
-                            group.expert_bytes, group.compute_bytes);
+                            group.expert_bytes, group.state_bytes, group.compute_bytes);
                 }
                 llama_perf_context_print(ctx.get());
                 const auto * vocab = llama_model_get_vocab(model.get());

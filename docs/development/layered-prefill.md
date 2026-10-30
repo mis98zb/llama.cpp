@@ -1,10 +1,12 @@
 # Experimental layer-major prefill for GLM5-Next and Qwen3.5 MoE
 
+This document describes the default expert-staging implementation. The [target layered-inference design and opt-in prototype](layered-inference-design.md) instead cover complete layer staging, upload-free complete-layer capacity planning, CPU-owned target state, and GPU MTP drafting with CPU verification. The expert-only latency planner and complete-layer capacity planner have different admission and calibration rules.
+
 ## Goal and scope
 
 Process a text prompt or appended suffix one contiguous layer group at a time. Keep the group's complete routed experts on the device while processing all input microbatches in position order. Only then replace them with the next group's weights. Group size one is the original layer-major path. This is not ordinary chunked prefill and is not a larger decode expert cache.
 
-The initial target is GLM-5.3-Flash, quantized GGUF, EPYC 7532 (AVX2), 256 GB RAM and a 20 GB SM86 GPU. Development on Windows has no target model. No real-model accuracy, 200K-token performance or speedup has been established.
+The initial target is GLM-5.3-Flash, quantized GGUF, EPYC 7532 (AVX2), 256 GB RAM and a 20 GB SM86 GPU. Development on Windows has no target model. Real-model GLM accuracy and a default-path speedup have not been established. Separate [full-layer GLM experiments](layered-inference-design.md#completed-200k-experiment) completed a synthetic 200K-token workload; they are not a representative quality benchmark or a controlled grouping comparison.
 
 The path is explicit opt-in. Default decode remains unchanged. It accepts sequence 0, consecutive text positions starting at zero, and the final token's logits. With `reuse_prefix = true`, the supplied tokens are only the suffix of the context's complete resident prefix state. Multimodal input batches, speculative contexts, adapters, shared-indexer variants, pending sequence edits and concurrent sequences remain unsupported.
 
@@ -31,6 +33,8 @@ For BF16 staging, internal group boundaries still round to BF16 and convert back
 
 BF16 staging is not lossless. In particular, rounding can change the DSA top-k selection. An exploratory sparse miniature model with seed 17 produced final-logit NMSE about `8.9e-3` relative to unrounded F32. This is not a real-model quality measurement, but it rules out claiming that BF16 staging always preserves the original logits closely. Evaluate BF16 on representative real prompts before using it for quality-sensitive work; select F32 staging to isolate scheduling correctness.
 
+GLM restores pooled indexer keys to F16 only with F32 activation staging. BF16 staging keeps the reference F32 indexer dispatch: the F16 dispatch combined with BF16 boundaries exceeded the existing same-backend logits tolerance at microbatch 97. Windowed indexer execution and compact visibility inputs remain enabled in both staging modes.
+
 For hidden size 4096, four streams and microbatch 256, one BF16 boundary block is 8 MiB in each direction. At 200000 newly evaluated tokens, the single complete BF16 activation buffer requires about 6.1 GiB of host RAM. One million newly evaluated tokens require about 30.5 GiB. These sizes exclude all other allocations and do not depend on microbatch size. An already cached prefix does not contribute activation rows.
 
 The routed experts of one layer contain `3 * 4096 * 2048 * 288` parameters. If all three tensors use Q4_K, their storage is about 3.80 GiB. Mixed GGUF quantization can require more. Check actual tensor sizes and backend operator support, not the file's Q4 label.
@@ -39,13 +43,27 @@ The complete working set includes current-layer weights, persistent device cache
 
 The experimental API separately limits the single host activation buffer plus pinned weight staging, the current expert buffer including backend padding, and the sum of scheduler compute buffers. The last limit is not a total-VRAM limit: persistent model/context allocations and backend-private kernel workspaces remain additional costs. Backend allocation failures are errors, not fallbacks. Locking the full activation buffer removes staging copies but makes that physical RAM unavailable for paging; keep the host limit below what the machine can safely pin.
 
-Start evaluation at microbatch 256, compare 512, and consider 1024 only after measuring real graphs. These are candidates, not verified capacity limits. Manual execution uses `n_ubatch` and `group_layers`; `auto_plan` searches smaller batches and variable-length groups. The selected batch size remains fixed for the entire request, so metadata replay never silently changes chunk boundaries. Actual graphs are measured again before allocation and must stay within their admitted workspace bound.
+Start evaluation at microbatch 256, compare 512, and consider larger batches only after checking real graphs. These are candidates, not universal capacity limits. Manual execution uses `n_ubatch` and `group_layers`; `auto_plan` searches smaller batches and variable-length groups. The selected batch size remains fixed for the entire request, so metadata replay never silently changes chunk boundaries. Admitted F32 complete-layer execution reuses the planner's workspace bound and checks actual allocated scheduler buffers before compute; other paths retain per-graph measurement.
 
 Admission/planning failures preserve an existing prefix. Once model execution has updated state, a failure can invalidate the whole context because KDA cannot be rolled back by deleting token positions. `prefix_invalidated` explicitly reports this case; the implementation logs it, returns an error and does not pretend that the old prefix can still be reused.
 
 Flash Attention and a suitable fused indexer are important at long context. With 200000 keys and 1024 queries, one dense F32 attention score tensor across 64 heads is about 48.8 GiB. A BF16 staging buffer does not reduce that workspace. Unsupported fused operations must not be disguised as successful GPU acceleration.
 
 If a complete layer's experts and required persistent state cannot fit, shrinking the microbatch cannot solve the fixed-memory problem. Report it instead of silently streaming experts repeatedly.
+
+## Execution timing
+
+Both examples report aggregate and per-group `prefill wall ms` from `stats.timing` and `group.timing`. `total_ms` measures selected execution, including host activation allocation and cleanup, but excludes planning/calibration; add `planning_ms` for the complete automatic-prefill phase. Failed requests do not expose partial execution timing as a successful result.
+
+The phases are host-wall intervals: `setup_ms` covers initial synchronization, metadata snapshot, host/pipeline buffers, batch construction and initial scheduler/output reservation; `memory_ms` covers group metadata replay, batch preparation, memory apply and microbatch advance; `weight_ms` covers weight-bank allocation/loading and next-bank prefetch setup; `state_upload_ms` and `state_download_ms` cover complete-layer state-bank allocation/upload and state download; `graph_ms` covers graph construction, workspace measurement, rebuilding, placement, checks and allocation; `inputs_ms` covers `set_inputs`, including CPU mask/index generation; `activation_upload_ms` and `activation_download_ms` cover explicit activation transfer calls and pipeline slot waits/drains; `output_ms` covers logits and MTP hidden-row downloads; `cleanup_ms` covers graph reset and resource release. `other` is total wall time minus the accounted phases, including bookkeeping between intervals.
+
+`compute_ms` is compute submission through the existing synchronization, including any overlapping activation/weight prefetch submissions in that interval. It is not CUDA-event kernel time. With pipelining, transfer fields measure host call/wait time, not independent device DMA duration; some transfer completion is charged to compute/wait. No extra device synchronization or events are added for timing. Phase wall intervals do not overlap, but they cannot establish actual GPU copy/compute overlap. `dispatch_ms` remains a planner dry-graph measurement, not execution `graph_ms`.
+
+`graph_build_ms`, `graph_measure_ms` and `graph_alloc_ms` subdivide `graph_ms`; do not add them to the phase total again. Counters distinguish graph builds, compatible graph reuse and execution-time dry measurements. Compatible graphs use the ordinary reuse guards, including recurrent positions, layer weights, outputs and pipeline slots. Admitted F32 full-layer plans avoid the measure/rebuild cycle even when shapes cannot be reused. Their allocated bound includes separately retained device and host scheduler maxima. BF16 and expert-only paths keep the existing measurement policy.
+
+The next prototype additionally reports `workspace_reserve_ms` within `graph_ms`, peak reserved workspace, maximum backend segment count, actual indexer query-window width, and compact causal/pool input flags. Boundaries identify potential stable CUDA graph segments; they do not count successful CUDA graph replays. See the [pending-validation record](layered-inference-design.md#workspace-query-windows-visibility-and-segmented-graphs-validation-pending) before interpreting these changes as measured GPU improvements.
+
+Accounting checks cover CPU/CUDA execution, synchronous and pipelined transfers, expert prefetch, complete-layer plans and prefix reuse. The real-model timing smoke test and deterministic-planning comparison are recorded in the [complete-layer design](layered-inference-design.md#deterministic-planner-smoke-test). These short-input tests are not a 200k phase profile.
 
 ## Validation
 
@@ -103,6 +121,8 @@ For a fixed two-layer group, add `--group-layers 2`. For joint automatic plannin
 
 ## Microbatch activation pipeline
 
+Single-layer groups remain the default. Multiple-layer groups reduce activation transfers, but do not reduce once-per-layer weight uploads. If the pipeline already hides those transfers behind compute, larger groups need not improve throughput and can reduce the microbatch that fits. Compare groups at a fixed microbatch before attributing a speedup to grouping. Full-layer GLM offload and its capacity planner are explicit opt-in experiments described in [the layered-inference design](layered-inference-design.md); they do not replace Qwen streaming or enable Qwen automatic planning.
+
 On an asynchronous GPU backend with events and pinned host buffers, `pipeline = true` (the default) uses two device input slots and two device output slots. One complete host activation buffer is pinned and updated in place. DMA reads and writes its microbatch slices directly, with no activation bounce buffers or host `memcpy`. Failure to obtain real pinned storage is an error, not a silent pageable substitute. `--no-pipeline` selects synchronous transfers but still uses one complete pinned buffer on a GPU.
 
 Each slot owns persistent device storage outside the scheduler's graph buffers. A graph reads its input slot and writes its output slot directly, so resetting the graph cannot invalidate an in-flight activation copy.
@@ -112,12 +132,16 @@ Each slot owns persistent device storage outside the scheduler's graph buffers. 
 - Once a microbatch has been submitted, the host queues the next microbatch's input upload before waiting for current compute.
 - After compute completes on all participating backends, the output slot is copied asynchronously over the same host slice that supplied its input. That slice's upload has already completed; the next input upload reads a disjoint slice.
 - A device output slot is not reused until its previous download completes. At group boundaries, all transfers are drained before the next group reads the overwritten host buffer. Error cleanup also drains the streams before releasing host storage.
+- Input lookahead reads the next prepared hybrid microbatch without advancing or applying memory state. It uses the actual token count, including a shortened penultimate microbatch that keeps the recurrent rollback tail intact.
 
-KDA computation remains sequential in token order. This pipelines transfers, not independent execution of causally dependent microbatches. Compute is still synchronized before graph reset; graph reuse and concurrent graph execution are not implemented.
+KDA computation remains sequential in token order. This pipelines transfers, not independent execution of causally dependent microbatches. Compute is still synchronized before graph reset. Full-layer execution can reuse compatible graphs; concurrent graph execution is not implemented.
 
 For hidden size 4096, four streams, BF16 staging and microbatch 256, the device slots occupy 32 MiB before backend padding, charged to `max_transfer_bytes`. There is no additional 32 MiB of pinned activation slots. The full pinned buffer is charged once to `max_host_bytes`. Scheduler compute buffers, experts and persistent state are additional allocations.
 
 Statistics report `activation_host_bytes`, `activation_pinned_bytes`, active pipelining, allocated device-slot/weight-staging transfer bytes, next-input prefetches and asynchronous output batches. Tests require exactly one suffix-sized activation allocation, no activation rows for the prefix, and transfer counts covering every eligible microbatch. They also cover a host budget that fits only one full buffer, insufficient transfer budgets and retry after failure. These counters establish that the asynchronous path executed, not a hardware-overlap percentage or an end-to-end speedup.
+In full-layer mode, `max_transfer_bytes = 0` (example option `--transfer-budget-mib 0`) sizes the transfer ceiling from the requested batch and actual backend padding. It does not bypass host/device admission or headroom. Explicit nonzero budgets retain their existing hard limits. Full host activations count only against the host budget, not the device-slot transfer budget. Short suffixes still reserve a legal nominal rollback batch.
+
+The final group does not export its complete residual to the host or to an output pipeline slot. It still computes all required state, final logits and requested MTP hidden rows. For a complete invocation with G groups, activation uploads and downloads each cover G-1 complete residual buffers; a single-group invocation needs neither transfer. With rollback disabled, each noninitial group prefetches every microbatch after its first, and each nonfinal group downloads every microbatch. The same rules apply to the actual variable-size splits when rollback is enabled. F32 staging at 200000 tokens, hidden size 4096 and four streams saves about 12.2 GiB of final-group downloads.
 
 ## Conditional next-layer expert prefetch
 

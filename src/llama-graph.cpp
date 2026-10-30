@@ -1208,8 +1208,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     if (inp_attn) {
         mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn,
-            ubatch->n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads);
+        if (inp_attn->causal_positions) {
+            mctx->get_attn()->set_input_causal_positions(inp_attn->causal_positions, ubatch);
+        } else {
+            mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn,
+                ubatch->n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads);
+        }
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1226,8 +1230,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
-    if (!inp_attn || !inp_rs ||
-        cparams.n_threads != params.cparams.n_threads || cparams.n_threads_batch != params.cparams.n_threads_batch) {
+    if (cparams.n_threads != params.cparams.n_threads || cparams.n_threads_batch != params.cparams.n_threads_batch) {
         return false;
     }
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
@@ -1236,16 +1239,20 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
-
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
-
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    if (inp_attn) {
+        res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+        if (inp_attn->causal_positions) {
+            res &= inp_attn->causal_positions->ne[0] == int64_t(mctx->get_attn()->get_n_kv()) + params.ubatch.n_tokens;
+        } else {
+            res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+        }
+    }
+    if (inp_rs) {
+        res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+        res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
+        res &= inp_rs->head == mctx->get_recr()->get_head();
+        res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    }
 
     return res;
 }
@@ -2899,7 +2906,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * selected) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2940,6 +2948,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+        if (selected) {
+            ggml_flash_attn_ext_set_indices(cur, selected);
+        }
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         if (v_mla) {
@@ -3940,11 +3951,26 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid(bool attn, 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
 }
 
-llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k(bool attn, bool recurrent) const {
+llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k(bool attn, bool recurrent, bool gpu_causal) const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = recurrent ? build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr()) : nullptr;
     auto inp_attn = attn ? build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn()) : nullptr;
+    if (inp_attn && gpu_causal && ubatch.n_seqs == 1 && cparams.causal_attn &&
+        hparams.f_max_alibi_bias == 0 && hparams.swa_type == LLAMA_SWA_TYPE_NONE && cparams.n_ctx < (1u << 24)) {
+        const int64_t keys = mctx_cur->get_attn()->get_n_kv();
+        inp_attn->causal_positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, keys + n_tokens);
+        ggml_set_name(inp_attn->causal_positions, "prefill_causal_positions");
+        ggml_set_input(inp_attn->causal_positions);
+        auto * key_pos = ggml_view_2d(ctx0, inp_attn->causal_positions, keys, 1, keys*sizeof(float), 0);
+        auto * query_pos = ggml_view_2d(ctx0, inp_attn->causal_positions, 1, n_tokens, sizeof(float), keys*sizeof(float));
+        auto * live = ggml_step(ctx0, ggml_scale_bias(ctx0, key_pos, 1.0f, 0.5f));
+        auto * distance = ggml_sub(ctx0, ggml_repeat_4d(ctx0, query_pos, keys, n_tokens, 1, 1), key_pos);
+        auto * causal = ggml_step(ctx0, ggml_scale_bias(ctx0, distance, 1.0f, 0.5f));
+        auto * mask = ggml_log(ctx0, ggml_mul(ctx0, causal, live));
+        inp_attn->self_kq_mask_cnv = ggml_cast(ctx0, mask, inp_attn->self_kq_mask->type);
+        inp_attn->self_kq_mask = nullptr;
+    }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

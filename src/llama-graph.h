@@ -402,6 +402,8 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
+    ggml_tensor * causal_positions = nullptr; // F32 [n_kv + n_tokens], eligible single-sequence layered input
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -1265,7 +1267,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * selected = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1433,7 +1436,7 @@ struct llm_graph_context {
     //
 
     llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool attn = true, bool recurrent = true) const;
-    llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k(bool attn = true, bool recurrent = true) const;
+    llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k(bool attn = true, bool recurrent = true, bool gpu_causal = false) const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
 

@@ -190,6 +190,7 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    std::vector<ggml_tensor *> get_layer_storage(uint32_t first, uint32_t count) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -467,6 +468,7 @@ public:
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+    void set_input_causal_positions(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 private:
     llama_memory_status status;

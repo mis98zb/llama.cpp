@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <unordered_set>
 
 namespace {
 
@@ -207,6 +208,9 @@ struct prefill_pipeline {
 
     void prefetch_input(size_t i, const uint8_t * source, size_t bytes) {
         auto & s = slots[i];
+        if (bytes == 0 || bytes > ggml_nbytes(s.input)) {
+            throw std::runtime_error("layered prefill input exceeds its pipeline slot");
+        }
         if (s.input_bytes) {
             ggml_backend_event_synchronize(s.input_ready.get());
         }
@@ -218,13 +222,16 @@ struct prefill_pipeline {
     void wait_input(size_t i, size_t bytes) {
         auto & s = slots[i];
         if (s.input_bytes != bytes) {
-            throw std::runtime_error("layered prefill pipeline requires consecutive fixed-size microbatches");
+            throw std::runtime_error("layered prefill pipeline input does not match the prepared microbatch");
         }
         ggml_backend_event_wait(compute, s.input_ready.get());
     }
 
     void copy_output(size_t i, uint8_t * destination, size_t bytes) {
         auto & s = slots[i];
+        if (bytes == 0 || bytes > ggml_nbytes(s.output) || s.output_pending) {
+            throw std::runtime_error("layered prefill output exceeds its pipeline slot or overwrites a pending copy");
+        }
         ggml_backend_tensor_get_async(download.get(), s.output, destination, 0, bytes);
         ggml_backend_event_record(s.output_ready.get(), download.get());
         s.output_pending = true;
@@ -899,6 +906,166 @@ struct prefill_demand {
     }
 };
 
+// Tensor identities stay unchanged while their storage is bound to the current device bank.
+struct prefill_layer_storage {
+    struct binding {
+        ggml_tensor * tensor;
+        ggml_backend_buffer_t buffer;
+        void * data;
+        ggml_tensor * copy;
+    };
+
+    ggml_backend_t backend;
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buffer;
+    std::vector<binding> bindings;
+
+    static size_t allocation_size(ggml_backend_t backend, const std::vector<ggml_tensor *> & tensors) {
+        const auto buft = ggml_backend_get_default_buffer_type(backend);
+        const size_t alignment = ggml_backend_buft_get_alignment(buft);
+        size_t bytes = 0;
+        std::unordered_set<ggml_tensor *> seen;
+        for (auto * tensor : tensors) {
+            if (tensor && !tensor->view_src && seen.insert(tensor).second) {
+                const size_t size = ggml_backend_buft_get_alloc_size(buft, tensor);
+                bytes = prefill_add(bytes, prefill_add(size, alignment - 1) / alignment * alignment);
+            }
+        }
+        return bytes;
+    }
+
+    prefill_layer_storage(ggml_backend_t backend, const std::vector<ggml_tensor *> & tensors,
+                          size_t budget, size_t headroom, bool weights, uint64_t & uploaded,
+                          bool measure = false) : backend(backend) {
+        if (tensors.empty()) {
+            return;
+        }
+        const auto buft = ggml_backend_get_default_buffer_type(backend);
+        const size_t bytes = allocation_size(backend, tensors);
+        std::unordered_set<ggml_tensor *> seen;
+        ctx.reset(ggml_init({tensors.size() * ggml_tensor_overhead(), nullptr, true}));
+        if (!ctx) {
+            throw llama_prefill_resource_error("failed to allocate full-layer tensor metadata");
+        }
+        for (auto * tensor : tensors) {
+            if (!tensor || !seen.insert(tensor).second) {
+                continue;
+            }
+            if (!tensor->buffer || !tensor->data || !ggml_backend_buffer_is_host(tensor->buffer)) {
+                throw std::runtime_error("full-layer prefill requires CPU-owned weights and state");
+            }
+            ggml_tensor * copy = nullptr;
+            if (!tensor->view_src) {
+                if (!ggml_is_contiguous(tensor)) {
+                    throw std::runtime_error("full-layer prefill requires contiguous tensor storage");
+                }
+                copy = ggml_dup_tensor(ctx.get(), tensor);
+                ggml_set_name(copy, tensor->name);
+            } else if (!seen.count(tensor->view_src)) {
+                throw std::runtime_error("full-layer storage view must follow its storage tensor");
+            }
+            bindings.push_back({tensor, tensor->buffer, tensor->data, copy});
+        }
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total_bytes);
+        if (bytes > budget || headroom > free_bytes || bytes > free_bytes - headroom) {
+            throw llama_prefill_resource_error("full-layer bank exceeds its device budget");
+        }
+        // Dry graphs need device placement, not storage. Their host addresses are never read by a backend.
+        buffer.reset(measure ? ggml_backend_buft_alloc_buffer(buft, 0) :
+            ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        if (!buffer || ggml_backend_buffer_get_size(buffer.get()) > budget) {
+            throw llama_prefill_resource_error("failed to allocate full-layer bank");
+        }
+        if (weights) {
+            ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+        for (auto & item : bindings) {
+            if (item.copy && !measure) {
+                ggml_backend_tensor_set(item.copy, item.data, 0, ggml_nbytes(item.tensor));
+                uploaded += ggml_nbytes(item.tensor);
+            }
+        }
+        for (auto & item : bindings) {
+            item.tensor->buffer = buffer.get();
+            item.tensor->data = measure ? item.data : item.copy ? item.copy->data :
+                static_cast<uint8_t *>(item.tensor->view_src->data) + item.tensor->view_offs;
+        }
+    }
+
+    void download(uint64_t & bytes) {
+        ggml_backend_synchronize(backend);
+        for (const auto & item : bindings) {
+            if (item.copy) {
+                ggml_backend_tensor_get(item.copy, item.data, 0, ggml_nbytes(item.tensor));
+                bytes += ggml_nbytes(item.tensor);
+            }
+        }
+    }
+
+    ~prefill_layer_storage() {
+        ggml_backend_synchronize(backend);
+        for (auto & item : bindings) {
+            item.tensor->buffer = item.buffer;
+            item.tensor->data = item.data;
+        }
+    }
+};
+
+std::vector<ggml_tensor *> prefill_layer_weights(const llama_model & model, uint32_t first, uint32_t count) {
+    std::vector<ggml_tensor *> result;
+    for (const auto & entry : model.tensors_by_name) {
+        for (uint32_t il = first; il < first + count; ++il) {
+            const auto prefix = "blk." + std::to_string(il) + ".";
+            if (entry.first.compare(0, prefix.size(), prefix) == 0) {
+                result.push_back(entry.second);
+                break;
+            }
+        }
+    }
+    if (first == 0) {
+        result.push_back(model.tok_embd);
+    }
+    if (first + count == model.hparams.n_layer()) {
+        result.push_back(model.output_norm);
+        result.push_back(model.output);
+    }
+    return result;
+}
+
+std::vector<ggml_tensor *> prefill_layer_state(llama_memory_hybrid_idx & memory, uint32_t first, uint32_t count) {
+    auto result = memory.get_mem_attn()->get_layer_storage(first, count);
+    auto indexer = memory.get_mem_idx()->get_layer_storage(first, count);
+    result.insert(result.end(), indexer.begin(), indexer.end());
+    auto * recurrent = memory.get_mem_recr();
+    for (const auto * storage : {&recurrent->r_l, &recurrent->s_l, &recurrent->p_l}) {
+        for (uint32_t il = first; il < first + count && il < storage->size(); ++il) {
+            if ((*storage)[il]) {
+                result.push_back((*storage)[il]);
+            }
+        }
+    }
+    return result;
+}
+
+void prefill_place_full_graph(ggml_backend_sched_t sched, ggml_cgraph * gf, ggml_backend_t device) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        auto * node = ggml_graph_node(gf, i);
+        if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_NONE) {
+            continue;
+        }
+        if (!ggml_backend_supports_op(device, node)) {
+            throw std::runtime_error(format("full-layer backend does not support %s (%s), src0=%s %lld/%lld/%lld/%lld src1=%s",
+                node->name, ggml_op_name(node->op), ggml_type_name(node->src[0]->type),
+                (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1],
+                (long long) node->src[0]->ne[2], (long long) node->src[0]->ne[3],
+                node->src[1] ? ggml_type_name(node->src[1]->type) : "none"));
+        }
+        ggml_backend_sched_set_tensor_backend(sched, node, device);
+    }
+}
+
 struct prefill_weight_prefetch {
     static bool can_upload_direct(const llama_layer & layer, ggml_backend_t backend, bool merge_gate_up) {
         const auto dev = ggml_backend_get_device(backend);
@@ -1119,9 +1286,22 @@ void prefill_place_staging(ggml_backend_sched_t sched, ggml_cgraph * gf,
 
 void prefill_check_graph(ggml_backend_sched_t sched, ggml_cgraph * gf,
                          const std::vector<llama_layer> & layers, ggml_backend_t device,
-                         const llm_graph_result & res) {
+                         const llm_graph_result & res, llama_layered_prefill_stats * stats = nullptr) {
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         auto * node = ggml_graph_node(gf, i);
+        if (stats) {
+            stats->f16_indexer_active |= node->op == GGML_OP_LIGHTNING_INDEXER && node->src[1]->type == GGML_TYPE_F16;
+            stats->compact_attention_active |= node->op == GGML_OP_FLASH_ATTN_EXT && node->src[5];
+            if (node->op == GGML_OP_LIGHTNING_INDEXER) {
+                stats->max_indexer_queries = std::max(stats->max_indexer_queries, uint32_t(node->src[0]->ne[2]));
+            }
+            for (const auto * source : node->src) {
+                if (source) {
+                    stats->compact_causal_input |= std::strcmp(source->name, "prefill_causal_positions") == 0;
+                    stats->compact_pool_input |= std::strcmp(source->name, "prefill_pool_ranges") == 0;
+                }
+            }
+        }
         bool expert = false;
         if (node->op == GGML_OP_MUL_MAT_ID) {
             for (const auto & layer : layers) {
@@ -1205,24 +1385,27 @@ int llama_context::prefill_layered(
     if (!tokens || n_tokens <= 0 || (!qwen && model.arch != LLM_ARCH_GLM5_NEXT) || hp.no_alloc ||
         !memory || cparams.n_seq_max != 1 || n_tokens > (int64_t) cparams.n_ctx ||
         n_tokens > (int64_t) cparams.n_batch || params.n_ubatch == 0 ||
-        params.n_ubatch > cparams.n_ubatch || params.max_host_bytes == 0 ||
+        params.n_ubatch > cparams.n_ubatch ||
+        (cparams.n_rs_seq > 0 && params.n_ubatch <= cparams.n_rs_seq + 1) || params.max_host_bytes == 0 ||
         params.max_expert_bytes == 0 || params.max_compute_bytes == 0 ||
         params.group_layers == 0 || params.max_group_layers == 0 ||
         params.test_weight_staging < -1 || params.test_weight_staging > 3 ||
         (params.staging_type != GGML_TYPE_F32 && params.staging_type != GGML_TYPE_BF16) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !cparams.causal_attn ||
-        cparams.embeddings || cparams.embeddings_nextn || cparams.n_rs_seq != 0 || cparams.cb_eval ||
+        cparams.embeddings || (cparams.embeddings_nextn && (!params.full_layers || cparams.embeddings_nextn_masked)) ||
+        (cparams.n_rs_seq != 0 && !params.full_layers) || cparams.cb_eval ||
         !sampling.samplers.empty() || !loras->empty() || moe_cache || !model.hdmd.rot.empty() ||
         std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
                     [](bool enabled) { return enabled; })) {
         LLAMA_LOG_ERROR("%s: unsupported request or configuration; see docs/development/layered-prefill.md\n", __func__);
         return -1;
     }
-    if ((params.stream_weights && (!qwen || params.group_layers != 1 || params.max_static_bytes == 0)) ||
+    if ((params.full_layers && qwen) ||
+        (params.stream_weights && (!qwen || params.group_layers != 1 || params.max_static_bytes == 0)) ||
         (qwen && params.auto_plan) ||
         (params.expert_slots && (!qwen || params.group_layers != 1 || params.auto_plan ||
                                  params.expert_slots > hp.n_expert || params.expert_slots < hp.n_expert_used()))) {
-        LLAMA_LOG_ERROR("%s: Qwen requires manual planning; expert slots require single-layer Qwen groups and at least top-k slots\n", __func__);
+        LLAMA_LOG_ERROR("%s: full layers require GLM; Qwen requires manual planning and expert slots require single-layer groups with at least top-k slots\n", __func__);
         return -1;
     }
     if (params.stream_weights) {
@@ -1253,6 +1436,10 @@ int llama_context::prefill_layered(
             LLAMA_LOG_ERROR("%s: shared indexers and control vectors are not supported\n", __func__);
             return -1;
         }
+    }
+    if (params.full_layers && (params.weight_prefetch || cparams.offload_kqv)) {
+        LLAMA_LOG_ERROR("%s: full-layer prefill requires no expert prefetch and CPU state\n", __func__);
+        return -1;
     }
     auto * hybrid = static_cast<llama_memory_hybrid *>(memory.get());
     if (!hybrid->has_complete_prefix(0)) {
@@ -1303,8 +1490,27 @@ int llama_context::prefill_layered(
         LLAMA_LOG_ERROR("%s: GPU timeline requires a manual GPU prefill, not CPU execution or calibration\n", __func__);
         return -1;
     }
+    if (params.full_layers && params.pipeline && params.max_transfer_bytes == 0) {
+        auto bounded = params;
+        try {
+            const size_t row = ggml_row_size(params.staging_type, int64_t(hp.n_embd) * hp.dsv4_hc_mult);
+            const uint32_t batch = std::max(std::min<uint32_t>(params.n_ubatch, n_tokens),
+                cparams.n_rs_seq > 0 ? cparams.n_rs_seq + 2 : 1);
+            if (batch > SIZE_MAX / 8 / row) {
+                throw llama_prefill_resource_error("automatic transfer buffer size overflow");
+            }
+            bounded.max_transfer_bytes = prefill_add(
+                prefill_pipeline::projected_device_bytes(device, hp, batch, params.staging_type), 4 * row * batch);
+            LLAMA_LOG_INFO("%s: automatic transfer budget %zu bytes, batch ceiling %u\n",
+                __func__, bounded.max_transfer_bytes, batch);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+            return -2;
+        }
+        return prefill_layered(tokens, n_tokens, bounded, stats_out);
+    }
     if (params.auto_plan) {
-        return prefill_layered_plan(tokens, n_tokens, params, stats_out, device);
+        return prefill_layered_plan(tokens, n_tokens, params, stats_out, device, params.full_layers);
     }
     std::vector<llama_layered_prefill_group> groups;
     for (uint32_t il = 0; il < hp.n_layer();) {
@@ -1325,6 +1531,7 @@ int llama_context::prefill_layered_run(
         const llama_layered_prefill_params & params, llama_layered_prefill_stats * stats_out,
         ggml_backend_t device, const std::vector<llama_layered_prefill_group> & groups,
         llama_prefill_probe * probe) {
+    const int64_t execution_start = ggml_time_us();
     const auto & hp = model.hparams;
     const bool pipelined = params.pipeline && device != backend_cpu;
     auto * mask_cache = static_cast<llama_memory_hybrid *>(memory.get())->get_mem_attn();
@@ -1341,11 +1548,12 @@ int llama_context::prefill_layered_run(
             stats.resident_state_bytes = prefill_add(stats.resident_state_bytes, item.second);
         }
     }
-    size_t compute_ceiling = 0, device_ceiling = 0;
+    size_t compute_ceiling = 0, device_ceiling = 0, host_ceiling = 0;
     for (const auto & group : groups) {
-        compute_ceiling = std::max(compute_ceiling, group.compute_bytes);
         device_ceiling = std::max(device_ceiling, group.device_compute_bytes);
+        host_ceiling = std::max(host_ceiling, group.compute_bytes - group.device_compute_bytes);
     }
+    compute_ceiling = prefill_add(device_ceiling, host_ceiling);
     bool started = false;
     bool computed = false;
     auto * hybrid_memory = model.arch == LLM_ARCH_GLM5_NEXT ?
@@ -1421,9 +1629,13 @@ int llama_context::prefill_layered_run(
         if (output_reserve(1) < 1) {
             throw llama_prefill_resource_error("failed to reserve layered prefill logits");
         }
+        stats.timing.setup_ms = (ggml_time_us() - execution_start) * 1e-3;
         started = true;
         llama_memory_context_ptr mctx;
         for (size_t i_group = 0; i_group < groups.size(); ++i_group) {
+            const int64_t group_start = ggml_time_us();
+            auto & timing = stats.groups[i_group].timing;
+            timing = {};
             const auto & group = groups[i_group];
             const uint32_t il = group.first_layer;
             const uint32_t last = il + group.n_layers;
@@ -1455,6 +1667,7 @@ int llama_context::prefill_layered_run(
             }
             memory_range.close();
             stats.memory_init_ms += (ggml_time_us() - memory_start) * 1e-3;
+            timing.memory_ms += (ggml_time_us() - group_start) * 1e-3;
             size_t group_bytes = 0;
             for (uint32_t lid = il; lid < last; ++lid) {
                 if (model.layers[lid].ffn_gate_exps || model.layers[lid].ffn_gate_up_exps) {
@@ -1505,13 +1718,47 @@ int llama_context::prefill_layered_run(
             std::vector<std::unique_ptr<prefill_experts>> banks;
             std::vector<std::unique_ptr<prefill_static_weights>> static_banks;
             std::vector<llama_layer> weights;
+            std::unique_ptr<prefill_layer_storage> full_weights;
+            std::unique_ptr<prefill_layer_storage> full_state;
             const int64_t load_start = ggml_time_us();
             prefill_profile_range load_range(profile.get(), "llama.weights", int(il));
             const uint64_t copy_before = stats.expert_copy_bytes;
             if (next_static[il]) {
                 next_static[il]->finish();
             }
+            if (params.full_layers) {
+                for (uint32_t lid = il; lid < last; ++lid) {
+                    if (prefill_layer_storage::allocation_size(device, prefill_layer_weights(model, lid, 1)) >
+                        params.max_expert_bytes) {
+                        throw llama_prefill_resource_error("complete layer exceeds the per-layer weight budget");
+                    }
+                }
+                full_weights = std::make_unique<prefill_layer_storage>(device,
+                    prefill_layer_weights(model, il, group.n_layers),
+                    params.max_group_expert_bytes ? params.max_group_expert_bytes : SIZE_MAX,
+                    params.prefetch_headroom_bytes, true, stats.layer_weight_bytes);
+                const size_t weight_bytes = ggml_backend_buffer_get_size(full_weights->buffer.get());
+                if (params.max_group_expert_bytes && weight_bytes > params.max_group_expert_bytes) {
+                    throw llama_prefill_resource_error("complete layer group exceeds the configured group budget");
+                }
+                const int64_t state_start = ggml_time_us();
+                full_state = std::make_unique<prefill_layer_storage>(device,
+                    prefill_layer_state(*hybrid_memory, il, group.n_layers), params.max_compute_bytes,
+                    params.prefetch_headroom_bytes, false, stats.state_upload_bytes);
+                timing.state_upload_ms += (ggml_time_us() - state_start) * 1e-3;
+                const size_t state_bytes = full_state->buffer ? ggml_backend_buffer_get_size(full_state->buffer.get()) : 0;
+                stats.groups[i_group].expert_bytes = weight_bytes;
+                stats.groups[i_group].state_bytes = state_bytes;
+                stats.peak_layer_bytes = std::max(stats.peak_layer_bytes,
+                    prefill_add(ggml_backend_buffer_get_size(full_weights->buffer.get()), state_bytes));
+                LLAMA_LOG_INFO("%s: full layers [%u,%u), peak bank=%zu bytes\n",
+                    __func__, il, last, stats.peak_layer_bytes);
+            }
             for (uint32_t lid = il; lid < last; ++lid) {
+                if (params.full_layers) {
+                    weights.push_back(model.layers[lid]);
+                    continue;
+                }
                 std::unique_ptr<prefill_experts> bank;
                 if (next_experts[lid]) {
                     next_experts[lid]->finish(stats);
@@ -1575,6 +1822,12 @@ int llama_context::prefill_layered_run(
                 if (pipeline) {
                     bytes = prefill_add(bytes, ggml_backend_buffer_get_size(pipeline->device_buffer.get()));
                 }
+                if (full_weights) {
+                    bytes = prefill_add(bytes, ggml_backend_buffer_get_size(full_weights->buffer.get()));
+                }
+                if (full_state && full_state->buffer) {
+                    bytes = prefill_add(bytes, ggml_backend_buffer_get_size(full_state->buffer.get()));
+                }
                 for (const auto & bank : banks) {
                     if (bank->buffer) {
                         bytes = prefill_add(bytes, ggml_backend_buffer_get_size(bank->buffer.get()));
@@ -1605,16 +1858,61 @@ int llama_context::prefill_layered_run(
             }
             stats.weight_load_ms += (ggml_time_us() - load_start) * 1e-3;
             load_range.close();
+            timing.weight_ms += (ggml_time_us() - load_start) * 1e-3 - timing.state_upload_ms;
+            if (params.full_layers && params.staging_type == GGML_TYPE_F32 && compute_ceiling) {
+                const int64_t reserve_start = ggml_time_us();
+                const uint32_t stale = prefix > 0 && hybrid_memory->mem_idx_stale_get()[0] !=
+                    llama_memory_hybrid_idx::POS_CLEAN ? prefix / hp.indexer_kpool : 0;
+                auto measured = hybrid_memory->init_measure(prefix + n_tokens,
+                    stale + params.n_ubatch / hp.indexer_kpool + 2);
+                llm_graph_result layout(gf_res_reserve->get_max_nodes());
+                auto gp = graph_params(&layout, mctx->get_ubatch(), measured.get(), LLM_GRAPH_TYPE_DECODER);
+                gp.n_outputs = 1;
+                gp.moe_cache = nullptr;
+                gp.prefill_layer = il;
+                gp.prefill_layers = group.n_layers;
+                gp.prefill_type = params.staging_type;
+                gp.prefill_weights = weights.data();
+                if (pipeline) {
+                    gp.prefill_input = il > 0 ? pipeline->slots[0].input : nullptr;
+                    gp.prefill_output = last < hp.n_layer() ? pipeline->slots[0].output : nullptr;
+                }
+                auto * graph = model.build_graph(gp);
+                if (!graph) {
+                    throw std::runtime_error("failed to build bounded prefill workspace graph");
+                }
+                prefill_place_full_graph(sched.get(), graph, device);
+                if (!ggml_backend_sched_reserve(sched.get(), graph)) {
+                    throw llama_prefill_resource_error("failed to reserve bounded prefill workspace");
+                }
+                size_t reserved = 0;
+                for (auto * backend : backend_ptrs) {
+                    reserved = prefill_add(reserved, ggml_backend_sched_get_buffer_size(sched.get(), backend));
+                }
+                if (reserved > params.max_compute_bytes || reserved > compute_ceiling) {
+                    throw llama_prefill_resource_error("reserved prefill workspace exceeds its admitted bound");
+                }
+                stats.reserved_workspace_bytes = std::max(stats.reserved_workspace_bytes, reserved);
+                ggml_backend_sched_reset(sched.get());
+                const double elapsed = (ggml_time_us() - reserve_start) * 1e-3;
+                timing.workspace_reserve_ms += elapsed;
+                timing.graph_ms += elapsed;
+            }
             size_t offset = 0;
             size_t i_batch = 0;
             if (pipeline && il > 0) {
+                const int64_t upload_start = ggml_time_us();
                 pipeline->prefetch_input(0, activations, row_bytes * mctx->get_ubatch().n_tokens);
+                timing.activation_upload_ms += (ggml_time_us() - upload_start) * 1e-3;
             }
+            bool more;
             do {
                 const auto & ubatch = mctx->get_ubatch();
                 const size_t slot = i_batch % 2;
                 if (pipeline) {
+                    const int64_t download_start = ggml_time_us();
                     pipeline->finish_output(slot);
+                    timing.activation_download_ms += (ggml_time_us() - download_start) * 1e-3;
                 }
                 const int64_t prepare_start = ggml_time_us();
                 prefill_profile_range setup_range(profile.get(), "llama.setup", int(il), int(i_batch));
@@ -1625,12 +1923,10 @@ int llama_context::prefill_layered_run(
                 const int64_t prepare_end = ggml_time_us();
                 apply_range.close();
                 stats.memory_apply_ms += (prepare_end - prepare_start) * 1e-3;
-                const int64_t build_start = ggml_time_us();
                 prefill_profile_range build_range(profile.get(), "llama.graph-build", int(il), int(i_batch));
+                timing.memory_ms += (prepare_end - prepare_start) * 1e-3;
                 n_outputs = last == hp.n_layer() && offset + ubatch.n_tokens == (size_t) n_tokens ? 1 : 0;
                 auto * res = get_gf_res_prev();
-                ggml_backend_sched_reset(sched.get());
-                res->reset();
                 auto gparams = graph_params(res, ubatch, mctx.get(), LLM_GRAPH_TYPE_DECODER);
                 if (model.arch == LLM_ARCH_QWEN35MOE) {
                     const auto callback = gparams.cb;
@@ -1673,31 +1969,88 @@ int llama_context::prefill_layered_run(
                 gparams.prefill_expert_map = demand ? demand->map : nullptr;
                 if (pipeline) {
                     gparams.prefill_input = il > 0 ? pipeline->slots[slot].input : nullptr;
-                    gparams.prefill_output = pipeline->slots[slot].output;
+                    gparams.prefill_output = last < hp.n_layer() ? pipeline->slots[slot].output : nullptr;
                 }
-                auto * gf = model.build_graph(gparams);
-                if (!gf) {
-                    throw std::runtime_error("failed to build layered prefill graph");
+                ggml_cgraph * gf = nullptr;
+                const bool use_admitted = params.full_layers && params.staging_type == GGML_TYPE_F32 && compute_ceiling > 0;
+                size_t measured_compute = stats.groups[i_group].compute_bytes;
+                if (params.full_layers && !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+                    gf = res->get_gf();
+                    ++stats.graph_reuses;
+                    ++n_reused;
+                } else {
+                    gf_res_prev_active = nullptr;
+                    ggml_backend_sched_reset(sched.get());
+                    res->reset();
+                    const auto build = [&]() {
+                        const int64_t begin = ggml_time_us();
+                        auto * graph = model.build_graph(gparams);
+                        if (!graph) {
+                            throw std::runtime_error("failed to build layered prefill graph");
+                        }
+                        if (params.full_layers) {
+                            prefill_place_full_graph(sched.get(), graph, device);
+                        }
+                        prefill_place_staging(sched.get(), graph, device, *res);
+                        const double elapsed = (ggml_time_us() - begin) * 1e-3;
+                        timing.graph_build_ms += elapsed;
+                        stats.graph_build_ms += elapsed;
+                        ++stats.graph_builds;
+                        return graph;
+                    };
+                    gf = build();
+                    if (!use_admitted) {
+                        const int64_t measure_start = ggml_time_us();
+                        std::vector<size_t> sizes(backend_ptrs.size());
+                        ggml_backend_sched_reserve_size(sched.get(), gf, sizes.data());
+                        prefill_check_graph(sched.get(), gf, weights, device, *res, &stats);
+                        measured_compute = 0;
+                        for (size_t i = 0; i < sizes.size(); ++i) {
+                            measured_compute = prefill_add(measured_compute, sizes[i]);
+                            if (backend_ptrs[i] == device) {
+                                stats.groups[i_group].device_compute_bytes =
+                                    std::max(stats.groups[i_group].device_compute_bytes, sizes[i]);
+                            }
+                        }
+                        if (measured_compute > params.max_compute_bytes ||
+                            (compute_ceiling && measured_compute > compute_ceiling)) {
+                            throw llama_prefill_resource_error("layered prefill workspace exceeds max_compute_bytes; reduce n_ubatch");
+                        }
+                        const double elapsed = (ggml_time_us() - measure_start) * 1e-3;
+                        timing.graph_measure_ms += elapsed;
+                        stats.graph_reserve_ms += elapsed;
+                        ++stats.graph_measurements;
+                        // Measurement rewrites graph sources to scheduler-owned copies.
+                        ggml_backend_sched_reset(sched.get());
+                        res->reset();
+                        gf = build();
+                    }
+                    const int64_t alloc_start = ggml_time_us();
+                    if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                        throw llama_prefill_resource_error("failed to allocate layered prefill graph");
+                    }
+                    const double elapsed = (ggml_time_us() - alloc_start) * 1e-3;
+                    timing.graph_alloc_ms += elapsed;
+                    stats.graph_alloc_ms += elapsed;
+                    gf_res_prev_active = res;
                 }
-                prefill_place_staging(sched.get(), gf, device, *res);
                 build_range.close();
-                const int64_t reserve_start = ggml_time_us();
-                stats.graph_build_ms += (reserve_start - build_start) * 1e-3;
-                prefill_profile_range reserve_range(profile.get(), "llama.graph-reserve", int(il), int(i_batch));
-                std::vector<size_t> sizes(backend_ptrs.size());
-                ggml_backend_sched_reserve_size(sched.get(), gf, sizes.data());
-                prefill_check_graph(sched.get(), gf, weights, device, *res);
                 size_t compute_bytes = 0;
-                for (size_t i = 0; i < sizes.size(); ++i) {
-                    compute_bytes = prefill_add(compute_bytes, sizes[i]);
-                    if (backend_ptrs[i] == device) {
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+                    compute_bytes = prefill_add(compute_bytes, backend_buf_exp_size[i]);
+                    if (use_admitted && backend_ptrs[i] == device) {
                         stats.groups[i_group].device_compute_bytes =
-                            std::max(stats.groups[i_group].device_compute_bytes, sizes[i]);
+                            std::max(stats.groups[i_group].device_compute_bytes, backend_buf_exp_size[i]);
                     }
                 }
-                if (compute_bytes > params.max_compute_bytes) {
-                    throw llama_prefill_resource_error(format("layered prefill workspace needs %zu bytes, limit %zu; reduce n_ubatch",
-                        compute_bytes, params.max_compute_bytes));
+                const size_t allocated_compute = compute_bytes;
+                if (allocated_compute > params.max_compute_bytes) {
+                    throw llama_prefill_resource_error(format("retained prefill workspace needs %zu bytes, limit %zu",
+                        allocated_compute, params.max_compute_bytes));
+                }
+                if (!use_admitted) {
+                    compute_bytes = measured_compute;
                 }
                 if (device != backend_cpu) {
                     const size_t workspace = std::max(stats.groups[i_group].device_compute_bytes,
@@ -1709,40 +2062,25 @@ int llama_context::prefill_layered_run(
                             total_device, params.max_device_bytes));
                     }
                 }
-                if (compute_ceiling && compute_bytes > compute_ceiling) {
-                    throw llama_prefill_resource_error("actual prefill graph exceeds the planner's workspace bound");
+                if (compute_bytes > params.max_compute_bytes || (compute_ceiling && compute_bytes > compute_ceiling)) {
+                    throw llama_prefill_resource_error(format(
+                        "allocated prefill graph exceeds its admitted workspace bound: actual=%zu planned=%zu limit=%zu",
+                        compute_bytes, compute_ceiling, params.max_compute_bytes));
                 }
                 stats.groups[i_group].compute_bytes = std::max(stats.groups[i_group].compute_bytes, compute_bytes);
-                stats.peak_compute_bytes = std::max(stats.peak_compute_bytes, compute_bytes);
-                // Splitting a measurement graph rewrites sources to scheduler-owned copies.
-                ggml_backend_sched_reset(sched.get());
-                reserve_range.close();
-                const int64_t rebuild_start = ggml_time_us();
-                stats.graph_reserve_ms += (rebuild_start - reserve_start) * 1e-3;
-                prefill_profile_range rebuild_range(profile.get(), "llama.graph-rebuild", int(il), int(i_batch));
-                res->reset();
-                gf = model.build_graph(gparams);
-                prefill_place_staging(sched.get(), gf, device, *res);
-                rebuild_range.close();
-                const int64_t alloc_start = ggml_time_us();
-                stats.graph_build_ms += (alloc_start - rebuild_start) * 1e-3;
-                prefill_profile_range alloc_range(profile.get(), "llama.graph-alloc", int(il), int(i_batch));
-                if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-                    throw llama_prefill_resource_error("failed to allocate layered prefill graph");
-                }
-                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                    backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
-                }
-                prefill_check_graph(sched.get(), gf, weights, device, *res);
-                alloc_range.close();
+                stats.peak_compute_bytes = std::max(stats.peak_compute_bytes, std::max(compute_bytes, allocated_compute));
+                stats.max_backend_segments = std::max(stats.max_backend_segments,
+                    uint32_t(ggml_backend_sched_get_n_splits(sched.get())));
+                prefill_check_graph(sched.get(), gf, weights, device, *res, &stats);
                 const int64_t inputs_start = ggml_time_us();
-                stats.graph_alloc_ms += (inputs_start - alloc_start) * 1e-3;
+                timing.graph_ms += (inputs_start - prepare_end) * 1e-3;
                 prefill_profile_range inputs_range(profile.get(), "llama.inputs", int(il), int(i_batch));
                 res->set_inputs(&ubatch);
                 inputs_range.close();
                 const int64_t inputs_end = ggml_time_us();
                 stats.graph_inputs_ms += (inputs_end - inputs_start) * 1e-3;
                 prefill_profile_range input_wait_range(profile.get(), "llama.input-wait", int(il), int(i_batch));
+                timing.inputs_ms += (inputs_end - inputs_start) * 1e-3;
                 const size_t bytes = row_bytes * ubatch.n_tokens;
                 if (res->t_prefill_in) {
                     if (pipeline) {
@@ -1759,6 +2097,7 @@ int llama_context::prefill_layered_run(
                 input_wait_range.close();
                 const int64_t prefetch_start = ggml_time_us();
                 stats.input_wait_ms += (prefetch_start - inputs_end) * 1e-3;
+                timing.activation_upload_ms += (prefetch_start - inputs_end) * 1e-3;
                 prefill_profile_range prefetch_range(profile.get(), "llama.prefetch-setup", int(il), int(i_batch));
                 if (i_batch == 0 && params.weight_prefetch &&
                     !demand && device != backend_cpu && i_group + 1 < groups.size()) {
@@ -1842,6 +2181,7 @@ int llama_context::prefill_layered_run(
                 stats.prefetch_setup_ms += (compute_start - prefetch_start) * 1e-3;
                 setup_range.close();
                 stats.graph_setup_ms += (compute_start - prepare_start) * 1e-3;
+                timing.weight_ms += (compute_start - prefetch_start) * 1e-3;
                 computed = true;
                 if (demand) {
                     demand->ids = res->t_prefill_ids;
@@ -1854,7 +2194,11 @@ int llama_context::prefill_layered_run(
                 prefill_profile_range enqueue_range(profile.get(), "llama.prefetch-enqueue", int(il), int(i_batch));
                 const size_t next = offset + ubatch.n_tokens;
                 if (pipeline && il > 0 && next < (size_t) n_tokens && status == GGML_STATUS_SUCCESS) {
-                    const size_t next_bytes = row_bytes * std::min<size_t>(params.n_ubatch, n_tokens - next);
+                    const auto * following = static_cast<const llama_memory_hybrid_context *>(mctx.get())->get_next_ubatch();
+                    if (!following || following->n_tokens == 0 || following->n_tokens > (size_t) n_tokens - next) {
+                        throw std::runtime_error("layered prefill pipeline has an invalid next microbatch");
+                    }
+                    const size_t next_bytes = row_bytes * following->n_tokens;
                     pipeline->prefetch_input((i_batch + 1) % 2, activations + next * row_bytes, next_bytes);
                     ++stats.input_prefetches;
                 }
@@ -1886,38 +2230,57 @@ int llama_context::prefill_layered_run(
                 }
                 const int64_t compute_end = ggml_time_us();
                 stats.compute_wait_ms += (compute_end - compute_start) * 1e-3;
+                timing.compute_ms += (compute_end - compute_start) * 1e-3;
                 if (probe) {
                     const auto * hybrid = static_cast<const llama_memory_hybrid_idx_context *>(mctx.get());
                     probe->points.push_back({il, ubatch.n_tokens, hybrid->get_attn()->get_n_kv(),
                         (compute_end - compute_start) * 1e-3,
                         (prepare_end - prepare_start + inputs_end - inputs_start) * 1e-3});
                 }
-                if (pipeline) {
-                    // Compute has consumed this slice; the next input upload uses a disjoint slice.
-                    pipeline->copy_output(slot, activations + offset * row_bytes, bytes);
-                    ++stats.async_output_batches;
-                } else {
-                    ggml_backend_tensor_get(res->t_prefill_out, activations + offset * row_bytes, 0, bytes);
+                const int64_t download_start = ggml_time_us();
+                if (res->t_prefill_out) {
+                    if (pipeline) {
+                        pipeline->copy_output(slot, activations + offset * row_bytes, bytes);
+                        ++stats.async_output_batches;
+                    } else {
+                        ggml_backend_tensor_get(res->t_prefill_out, activations + offset * row_bytes, 0, bytes);
+                    }
+                    stats.activation_write_bytes += bytes;
+                    if (probe) {
+                        probe->write_bytes += bytes;
+                        probe->write_ms += (ggml_time_us() - compute_end) * 1e-3;
+                    }
                 }
-                stats.activation_write_bytes += bytes;
-                if (probe) {
-                    probe->write_bytes += bytes;
-                    probe->write_ms += (ggml_time_us() - compute_end) * 1e-3;
-                }
+                const int64_t output_start = ggml_time_us();
+                timing.activation_download_ms += (output_start - download_start) * 1e-3;
                 if (n_outputs) {
                     ggml_backend_tensor_get(res->t_logits, logits.data, 0, model.vocab.n_tokens() * sizeof(float));
                 }
+                if (cparams.embeddings_nextn && last == hp.n_layer()) {
+                    if (!res->t_h_nextn || !embd_nextn.data) {
+                        throw std::runtime_error("full-layer prefill did not produce MTP hidden states");
+                    }
+                    ggml_backend_tensor_get(res->t_h_nextn, embd_nextn.data + offset * hp.n_embd,
+                                            0, size_t(ubatch.n_tokens) * hp.n_embd * sizeof(float));
+                }
+                timing.output_ms += (ggml_time_us() - output_start) * 1e-3;
                 stats.activation_copy_ms += (ggml_time_us() - compute_end) * 1e-3;
                 offset += ubatch.n_tokens;
                 ++stats.microbatches;
                 ++i_batch;
-            } while (mctx->next());
+                const int64_t next_start = ggml_time_us();
+                more = mctx->next();
+                timing.memory_ms += (ggml_time_us() - next_start) * 1e-3;
+            } while (more);
             if (offset != (size_t) n_tokens) {
                 throw std::runtime_error("layered prefill did not consume the complete prompt");
             }
             if (pipeline) {
+                const int64_t drain_start = ggml_time_us();
                 pipeline->drain();
+                timing.activation_download_ms += (ggml_time_us() - drain_start) * 1e-3;
             }
+            const int64_t reset_start = ggml_time_us();
             ggml_backend_sched_reset(sched.get());
             for (auto & res : gf_res_prev) {
                 if (res) {
@@ -1927,7 +2290,23 @@ int llama_context::prefill_layered_run(
             if (params.stream_weights && device != backend_cpu) {
                 spare_experts = std::move(banks[0]);
             }
+            timing.cleanup_ms += (ggml_time_us() - reset_start) * 1e-3;
+            if (full_state) {
+                const int64_t state_start = ggml_time_us();
+                full_state->download(stats.state_download_bytes);
+                timing.state_download_ms += (ggml_time_us() - state_start) * 1e-3;
+            }
+            const int64_t release_start = ggml_time_us();
+            full_state.reset();
+            full_weights.reset();
+            demand.reset();
+            banks.clear();
+            static_banks.clear();
+            timing.cleanup_ms += (ggml_time_us() - release_start) * 1e-3;
+            timing.total_ms = (ggml_time_us() - group_start) * 1e-3;
+            stats.timing.add(timing);
         }
+        const int64_t finish_start = ggml_time_us();
         n_outputs = probe ? 0 : 1;
         std::fill(output_ids.begin(), output_ids.end(), -1);
         if (!probe) {
@@ -1946,6 +2325,17 @@ int llama_context::prefill_layered_run(
         stats.mask_calls = mask_after.calls;
         stats.mask_parallel_calls = mask_after.parallel_calls;
         stats.mask_max_threads = mask_after.max_threads;
+        next_experts.clear();
+        weight_worker.reset();
+        next_static.clear();
+        spare_experts.reset();
+        staging_pool.reset();
+        pipeline.reset();
+        activation_buffer.reset();
+        restore_metadata = {};
+        replay.reset();
+        stats.timing.cleanup_ms += (ggml_time_us() - finish_start) * 1e-3;
+        stats.timing.total_ms = (ggml_time_us() - execution_start) * 1e-3;
         if (stats_out) {
             *stats_out = stats;
         }
@@ -1994,6 +2384,7 @@ int llama_context::prefill_layered_plan(
     const bool pipelined = params.pipeline && gpu;
     const int64_t planning_start = ggml_time_us();
     llama_layered_prefill_stats diagnostic;
+    diagnostic.capacity_only = params.full_layers;
     const bool has_prefix = memory->seq_pos_max(0) >= 0;
     const uint32_t prefix_tokens = memory->seq_pos_max(0) + 1;
     auto * hybrid_memory = static_cast<llama_memory_hybrid_idx *>(memory.get());
@@ -2067,7 +2458,9 @@ int llama_context::prefill_layered_plan(
                 probe_layers = std::max(probe_layers, il + 1);
             }
             size_t bytes = 0, data = 0;
-            if (model.layers[il].ffn_gate_exps) {
+            if (params.full_layers) {
+                bytes = prefill_layer_storage::allocation_size(device, prefill_layer_weights(model, il, 1));
+            } else if (model.layers[il].ffn_gate_exps) {
                 bytes = prefill_experts::allocation_size(model.layers[il], device);
                 for (auto * t : prefill_experts::tensors(model.layers[il])) {
                     data = prefill_add(data, ggml_nbytes(t));
@@ -2075,13 +2468,15 @@ int llama_context::prefill_layered_plan(
             }
             if (bytes > params.max_expert_bytes) {
                 diagnostic.budget_shortfall_bytes = bytes - params.max_expert_bytes;
-                throw llama_prefill_resource_error(format("resident expert layer needs %zu bytes, per-layer limit %zu, gap %zu",
-                    bytes, params.max_expert_bytes, diagnostic.budget_shortfall_bytes));
+                throw llama_prefill_resource_error(format("%s layer needs %zu bytes, per-layer limit %zu, gap %zu",
+                    params.full_layers ? "complete" : "resident expert", bytes,
+                    params.max_expert_bytes, diagnostic.budget_shortfall_bytes));
             }
             if (params.max_group_expert_bytes && bytes > params.max_group_expert_bytes) {
                 diagnostic.budget_shortfall_bytes = bytes - params.max_group_expert_bytes;
-                throw llama_prefill_resource_error(format("resident expert layer needs %zu bytes, group limit %zu, gap %zu",
-                    bytes, params.max_group_expert_bytes, diagnostic.budget_shortfall_bytes));
+                throw llama_prefill_resource_error(format("%s layer needs %zu bytes, group limit %zu, gap %zu",
+                    params.full_layers ? "complete" : "resident expert", bytes,
+                    params.max_group_expert_bytes, diagnostic.budget_shortfall_bytes));
             }
             allocation.push_back(bytes);
             payload.push_back(data);
@@ -2097,7 +2492,9 @@ int llama_context::prefill_layered_plan(
             prefill_profile->ratio_tokens = n_tokens;
         }
         std::vector<uint32_t> batches;
-        for (uint32_t b = std::min<uint32_t>(params.n_ubatch, n_tokens); b > 0; b /= 2) {
+        const uint32_t min_batch = cparams.n_rs_seq > 0 ? cparams.n_rs_seq + 2 : 1;
+        const uint32_t largest_batch = std::max(std::min<uint32_t>(params.n_ubatch, n_tokens), min_batch);
+        for (uint32_t b = largest_batch; b >= min_batch; b /= 2) {
             batches.push_back(b);
         }
         std::map<uint32_t, llama_prefill_cost> costs;
@@ -2152,7 +2549,8 @@ int llama_context::prefill_layered_plan(
         }
         if (costs.empty()) {
             diagnostic.capacity_only = true;
-            LLAMA_LOG_WARN("%s: no compatible timing profile; selecting a resident capacity plan without destructive calibration\n", __func__);
+            LLAMA_LOG_WARN("%s: selecting a %s capacity plan without destructive calibration\n",
+                __func__, params.full_layers ? "full-layer" : "resident");
         }
         fresh_scheduler();
         LLAMA_LOG_DEBUG("%s: measuring candidate groups\n", __func__);
@@ -2193,18 +2591,28 @@ int llama_context::prefill_layered_plan(
                 for (uint32_t il = first; il < first + count; ++il) {
                     weight_bytes = prefill_add(weight_bytes, allocation[il]);
                 }
+                const auto full_tensors = params.full_layers ? prefill_layer_weights(model, first, count) :
+                    std::vector<ggml_tensor *>();
+                const auto state_tensors = params.full_layers ? prefill_layer_state(*hybrid_memory, first, count) :
+                    std::vector<ggml_tensor *>();
+                if (params.full_layers) {
+                    weight_bytes = prefill_layer_storage::allocation_size(device, full_tensors);
+                    result.group.state_bytes = prefill_layer_storage::allocation_size(device, state_tensors);
+                }
+                const size_t bank_bytes = prefill_add(weight_bytes, result.group.state_bytes);
                 if ((params.max_group_expert_bytes && weight_bytes > params.max_group_expert_bytes) ||
-                    weight_bytes > device_budget) {
+                    bank_bytes > device_budget || result.group.state_bytes > params.max_compute_bytes) {
                     throw llama_prefill_resource_error("group expert budget");
                 }
                 result.group.expert_bytes = weight_bytes;
                 if (sample_batches.find(b) == sample_batches.end()) {
                     llama_batch_ext batch(this);
-                    for (uint32_t i = 0; i < b; ++i) {
+                    const uint32_t sample_tokens = std::min<uint32_t>(b, n_tokens);
+                    for (uint32_t i = 0; i < sample_tokens; ++i) {
                         const auto idx = batch.add_token(0);
                         const llama_pos pos = prefix_tokens + i;
                         if (idx < 0 || !batch.set_token_id(idx, tokens[i]) ||
-                            !batch.set_token_pos(idx, &pos) || !batch.set_output(idx, i + 1 == b)) {
+                            !batch.set_token_pos(idx, &pos) || !batch.set_output(idx, i + 1 == sample_tokens)) {
                             throw std::runtime_error("failed to build joint prefill measurement batch");
                         }
                     }
@@ -2217,7 +2625,20 @@ int llama_context::prefill_layered_plan(
                 std::vector<std::unique_ptr<prefill_experts>> banks;
                 std::vector<llama_layer> weights;
                 llama_layered_prefill_stats ignored;
+                std::unique_ptr<prefill_layer_storage> full_weights;
+                std::unique_ptr<prefill_layer_storage> full_state;
+                if (params.full_layers) {
+                    // Zero-sized placement markers keep dry graphs free of device allocations and transfers.
+                    full_weights = std::make_unique<prefill_layer_storage>(device, full_tensors,
+                        weight_bytes, params.prefetch_headroom_bytes, true, ignored.layer_weight_bytes, true);
+                    full_state = std::make_unique<prefill_layer_storage>(device, state_tensors,
+                        params.max_compute_bytes, params.prefetch_headroom_bytes, false, ignored.state_upload_bytes, true);
+                }
                 for (uint32_t il = first; il < first + count; ++il) {
+                    if (params.full_layers) {
+                        weights.push_back(model.layers[il]);
+                        continue;
+                    }
                     auto bank = std::make_unique<prefill_experts>(model.layers[il], device,
                                                                 params.max_expert_bytes, ignored, true, true);
                     if (allocation[il] && !bank->buffer) {
@@ -2242,8 +2663,12 @@ int llama_context::prefill_layered_plan(
                 gp.prefill_type = params.staging_type;
                 gp.prefill_weights = weights.data();
                 const int64_t start = ggml_time_us();
+                ++diagnostic.planner_graphs;
                 auto * gf = model.build_graph(gp);
                 std::vector<size_t> sizes(backend_ptrs.size());
+                if (params.full_layers) {
+                    prefill_place_full_graph(sched.get(), gf, device);
+                }
                 ggml_backend_sched_reserve_size(sched.get(), gf, sizes.data());
                 prefill_check_graph(sched.get(), gf, weights, device, res);
                 for (size_t i = 0; i < sizes.size(); ++i) {
@@ -2252,17 +2677,19 @@ int llama_context::prefill_layered_plan(
                         result.group.device_compute_bytes = sizes[i];
                     }
                 }
-                ggml_backend_sched_reset(sched.get());
-                res.reset();
-                model.build_graph(gp);
+                if (!params.full_layers) {
+                    ggml_backend_sched_reset(sched.get());
+                    res.reset();
+                    model.build_graph(gp);
+                }
                 result.group.dispatch_ms = (ggml_time_us() - start) * 1e-3;
                 ggml_backend_sched_reset(sched.get());
                 const size_t transfer_device = transfer_device_bytes(b);
                 result.fits = result.group.compute_bytes <= params.max_compute_bytes &&
                     transfer_device <= params.max_transfer_bytes &&
-                    weight_bytes <= device_budget &&
-                    result.group.device_compute_bytes <= device_budget - weight_bytes &&
-                    transfer_device <= device_budget - weight_bytes - result.group.device_compute_bytes;
+                    bank_bytes <= device_budget &&
+                    result.group.device_compute_bytes <= device_budget - bank_bytes &&
+                    transfer_device <= device_budget - bank_bytes - result.group.device_compute_bytes;
             } catch (const llama_prefill_resource_error &) {
                 ggml_backend_sched_reset(sched.get());
             }
@@ -2304,6 +2731,86 @@ int llama_context::prefill_layered_plan(
                 active_batches.push_back(item.first);
             }
         }
+        if (params.full_layers) {
+            std::vector<size_t> state_sizes;
+            for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+                state_sizes.push_back(prefill_layer_storage::allocation_size(
+                    device, prefill_layer_state(*hybrid_memory, il, 1)));
+            }
+            for (uint32_t b : batches) {
+                const size_t transfer_device = transfer_device_bytes(b);
+                size_t workspace = std::min(params.max_compute_bytes, gpu ? device_budget / 4 : params.max_compute_bytes);
+                for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+                    const size_t fixed = prefill_add(prefill_add(allocation[il], state_sizes[il]), transfer_device);
+                    workspace = std::min(workspace, fixed < device_budget ? device_budget - fixed : 0);
+                }
+                while (true) {
+                    candidate plan = {b, {}, 0};
+                    ++diagnostic.planner_candidates;
+                    uint32_t first = 0;
+                    while (first < hp.n_layer()) {
+                        llama_layered_prefill_group group;
+                        group.first_layer = first;
+                        group.n_layers = 0;
+                        while (group.n_layers < params.max_group_layers && first + group.n_layers < hp.n_layer()) {
+                            const uint32_t il = first + group.n_layers;
+                            const size_t weight = prefill_add(group.expert_bytes, allocation[il]);
+                            const size_t state = prefill_add(group.state_bytes, state_sizes[il]);
+                            const size_t required = prefill_add(prefill_add(weight, state),
+                                prefill_add(workspace, transfer_device));
+                            if ((params.max_group_expert_bytes && weight > params.max_group_expert_bytes) ||
+                                state > params.max_compute_bytes || required > device_budget) {
+                                break;
+                            }
+                            group.expert_bytes = weight;
+                            group.state_bytes = state;
+                            ++group.n_layers;
+                        }
+                        if (group.n_layers == 0) {
+                            break;
+                        }
+                        first += group.n_layers;
+                        plan.groups.push_back(group);
+                    }
+                    if (first != hp.n_layer()) {
+                        break;
+                    }
+                    bool fits = true;
+                    size_t measured_workspace = 0, host_workspace = 0;
+                    for (auto & group : plan.groups) {
+                        const auto admitted = measure(b, group.first_layer, group.n_layers);
+                        group = admitted.group;
+                        fits &= admitted.fits;
+                        measured_workspace = std::max(measured_workspace, group.device_compute_bytes);
+                        host_workspace = std::max(host_workspace, group.compute_bytes - group.device_compute_bytes);
+                    }
+                    bool capacity = true;
+                    for (const auto & group : plan.groups) {
+                        const size_t required = prefill_add(prefill_add(group.expert_bytes, group.state_bytes),
+                            prefill_add(measured_workspace, transfer_device));
+                        capacity &= required <= device_budget;
+                    }
+                    if (fits && capacity && prefill_add(measured_workspace, host_workspace) <= params.max_compute_bytes) {
+                        candidates.push_back(std::move(plan));
+                        break;
+                    }
+                    if (measured_workspace > workspace && measured_workspace <= params.max_compute_bytes) {
+                        LLAMA_LOG_INFO("%s: full-layer dry graph raises workspace reserve from %zu to %zu bytes\n",
+                            __func__, workspace, measured_workspace);
+                        workspace = measured_workspace;
+                        continue;
+                    }
+                    break;
+                }
+                if (!candidates.empty()) {
+                    break;
+                }
+                LLAMA_LOG_INFO("%s: full-layer plan at batch %u exceeds capacity; trying a smaller batch\n", __func__, b);
+            }
+        }
+        if (params.full_layers) {
+            active_batches.clear();
+        }
         for (uint32_t b : active_batches) {
             for (uint32_t cap = 1; cap <= std::min(params.max_group_layers, hp.n_layer()); ++cap) {
                 candidate plan = {b, {}, 0};
@@ -2327,6 +2834,17 @@ int llama_context::prefill_layered_plan(
                 size_t device_compute = 0;
                 for (const auto & group : plan.groups) {
                     device_compute = std::max(device_compute, group.device_compute_bytes);
+                }
+                if (params.full_layers) {
+                    bool fits = true;
+                    for (const auto & group : plan.groups) {
+                        const size_t required = prefill_add(prefill_add(group.expert_bytes, group.state_bytes),
+                            prefill_add(device_compute, transfer_device_bytes(b)));
+                        fits &= required <= device_budget;
+                    }
+                    if (!fits) {
+                        continue;
+                    }
                 }
                 if (!diagnostic.capacity_only && params.weight_prefetch && gpu) {
                     for (size_t g = 0; g + 1 < plan.groups.size(); ++g) {
@@ -2373,6 +2891,7 @@ int llama_context::prefill_layered_plan(
                 fallback.calibration_ms += diagnostic.calibration_ms;
                 fallback.calibration_probes += diagnostic.calibration_probes;
                 fallback.planner_candidates += diagnostic.planner_candidates;
+                fallback.planner_graphs += diagnostic.planner_graphs;
                 fallback.planning_ms = (ggml_time_us() - planning_start) * 1e-3;
                 if (stats_out) {
                     *stats_out = std::move(fallback);
@@ -2380,9 +2899,9 @@ int llama_context::prefill_layered_plan(
                 return status;
             }
             for (uint32_t il = 0; il < hp.n_layer(); ++il) {
-                const auto minimum = measure(1, il, 1);
-                const size_t transfer_device = transfer_device_bytes(1);
-                const size_t required = prefill_add(allocation[il],
+                const auto minimum = measure(min_batch, il, 1);
+                const size_t transfer_device = transfer_device_bytes(min_batch);
+                const size_t required = prefill_add(prefill_add(allocation[il], minimum.group.state_bytes),
                     prefill_add(minimum.group.device_compute_bytes, transfer_device));
                 diagnostic.minimum_additional_bytes = std::max(diagnostic.minimum_additional_bytes, required);
                 if (allocation[il] > device_budget) {
@@ -2391,6 +2910,10 @@ int llama_context::prefill_layered_plan(
                 if (minimum.group.compute_bytes > params.max_compute_bytes) {
                     diagnostic.budget_shortfall_bytes = std::max(diagnostic.budget_shortfall_bytes,
                         minimum.group.compute_bytes - params.max_compute_bytes);
+                }
+                if (minimum.group.state_bytes > params.max_compute_bytes) {
+                    diagnostic.budget_shortfall_bytes = std::max(diagnostic.budget_shortfall_bytes,
+                        minimum.group.state_bytes - params.max_compute_bytes);
                 }
             }
             const bool overflow = params.prefetch_headroom_bytes > SIZE_MAX - diagnostic.minimum_additional_bytes;
@@ -2510,6 +3033,7 @@ int llama_context::prefill_layered_plan(
         const int status = prefill_layered_run(tokens, n_tokens, selected, &result, device, candidates[chosen].groups);
         if (stats_out) {
             result.planner_candidates = diagnostic.planner_candidates;
+            result.planner_graphs = diagnostic.planner_graphs;
             result.calibration_probes = diagnostic.calibration_probes;
             result.profile_reused = diagnostic.profile_reused;
             result.calibration_ms = diagnostic.calibration_ms;

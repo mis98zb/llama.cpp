@@ -21,6 +21,51 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // Limits are bytes and exclude model and persistent context allocations.
 // The host, expert and compute limits must be nonzero.
 // max_compute_bytes bounds scheduler buffers, not backend-private kernel workspaces.
+struct llama_layered_prefill_timing {
+    double total_ms = 0;
+    double setup_ms = 0;
+    double memory_ms = 0;
+    double weight_ms = 0;
+    double state_upload_ms = 0;
+    double graph_ms = 0;
+    double graph_build_ms = 0; // components of graph_ms, not additional phases
+    double graph_measure_ms = 0;
+    double graph_alloc_ms = 0;
+    double workspace_reserve_ms = 0; // part of graph_ms
+    double inputs_ms = 0;
+    double activation_upload_ms = 0;
+    double compute_ms = 0;
+    double activation_download_ms = 0;
+    double output_ms = 0;
+    double state_download_ms = 0;
+    double cleanup_ms = 0;
+
+    double accounted_ms() const {
+        return setup_ms + memory_ms + weight_ms + state_upload_ms + graph_ms + inputs_ms +
+            activation_upload_ms + compute_ms + activation_download_ms + output_ms + state_download_ms + cleanup_ms;
+    }
+
+    void add(const llama_layered_prefill_timing & other) {
+        total_ms += other.total_ms;
+        setup_ms += other.setup_ms;
+        memory_ms += other.memory_ms;
+        weight_ms += other.weight_ms;
+        state_upload_ms += other.state_upload_ms;
+        graph_ms += other.graph_ms;
+        graph_build_ms += other.graph_build_ms;
+        graph_measure_ms += other.graph_measure_ms;
+        graph_alloc_ms += other.graph_alloc_ms;
+        workspace_reserve_ms += other.workspace_reserve_ms;
+        inputs_ms += other.inputs_ms;
+        activation_upload_ms += other.activation_upload_ms;
+        compute_ms += other.compute_ms;
+        activation_download_ms += other.activation_download_ms;
+        output_ms += other.output_ms;
+        state_download_ms += other.state_download_ms;
+        cleanup_ms += other.cleanup_ms;
+    }
+};
+
 struct llama_layered_prefill_group {
     uint32_t first_layer = 0;
     uint32_t n_layers = 1;
@@ -29,6 +74,8 @@ struct llama_layered_prefill_group {
     size_t compute_bytes = 0;
     size_t device_compute_bytes = 0;
     double dispatch_ms = 0;
+    size_t state_bytes = 0; // full-layer device state bank; expert_bytes then includes all group weights
+    llama_layered_prefill_timing timing = {};
 };
 
 struct llama_layered_prefill_params {
@@ -39,7 +86,7 @@ struct llama_layered_prefill_params {
     size_t max_compute_bytes = size_t(8) << 30;
     bool require_gpu = true; // false enables CPU correctness testing
     bool pipeline = true;
-    size_t max_transfer_bytes = size_t(512) << 20; // activation device slots and pinned weight staging; full activations use max_host_bytes
+    size_t max_transfer_bytes = size_t(512) << 20; // device slots and pinned weights; zero sizes full-layer transfers automatically
     bool weight_prefetch = true;
     size_t max_prefetch_bytes = size_t(6) << 30; // additional next-layer device weights
     size_t prefetch_headroom_bytes = size_t(512) << 20; // resident-planning and prefetch safety margin
@@ -58,6 +105,7 @@ struct llama_layered_prefill_params {
     bool merge_gate_up = false; // pack compatible streamed gate/up experts for one matrix product
     bool defer_static_upload = false; // prepare next-layer static weights before compute, submit DMA afterwards
     int32_t test_weight_staging = -1; // tests only: -1 automatic with direct pinned uploads; 0..3 staged reuse/worker bitmask
+    bool full_layers = false; // exclusive access; CPU-owned weights/state, upload-free capacity planning
 };
 
 struct llama_layered_prefill_stats {
@@ -68,6 +116,16 @@ struct llama_layered_prefill_stats {
     size_t activation_pinned_bytes = 0;
     uint32_t expert_layer_loads = 0;
     uint32_t microbatches = 0;
+    uint32_t graph_builds = 0;
+    uint32_t graph_reuses = 0;
+    uint32_t graph_measurements = 0;
+    bool f16_indexer_active = false;
+    bool compact_attention_active = false;
+    size_t reserved_workspace_bytes = 0;
+    uint32_t max_backend_segments = 0;
+    uint32_t max_indexer_queries = 0;
+    bool compact_causal_input = false;
+    bool compact_pool_input = false;
     size_t peak_compute_bytes = 0;
     size_t transfer_buffer_bytes = 0;
     uint32_t input_prefetches = 0;
@@ -83,6 +141,7 @@ struct llama_layered_prefill_stats {
     uint32_t selected_ubatch = 0;
     std::vector<llama_layered_prefill_group> groups;
     uint32_t planner_candidates = 0;
+    uint32_t planner_graphs = 0; // dry graphs built for admission, including pre-execution corrections
     uint32_t calibration_probes = 0;
     bool profile_reused = false;
     double calibration_ms = 0;
@@ -138,6 +197,11 @@ struct llama_layered_prefill_stats {
     size_t peak_weight_staging_bytes = 0;
     uint64_t weight_worker_bytes = 0;
     uint64_t direct_expert_bytes = 0;
+    uint64_t layer_weight_bytes = 0;
+    uint64_t state_upload_bytes = 0;
+    uint64_t state_download_bytes = 0;
+    size_t peak_layer_bytes = 0;
+    llama_layered_prefill_timing timing; // host wall time for selected execution, excluding planning/calibration
 };
 
 // Allocate persistent state and scheduler metadata, without full-model compute buffers.

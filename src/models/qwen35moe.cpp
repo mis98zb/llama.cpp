@@ -253,15 +253,19 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         }
     }
     if (layered) {
-        res->t_prefill_out = ggml_cast(ctx0, inpL, params.prefill_type);
-        if (params.prefill_output) {
-            auto * t = params.prefill_output;
-            auto * dst = ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], 0);
-            res->t_prefill_out = ggml_cpy(ctx0, res->t_prefill_out, dst);
+        if (last != n_layer) {
+            res->t_prefill_out = ggml_cast(ctx0, inpL, params.prefill_type);
+            if (params.prefill_output) {
+                auto * t = params.prefill_output;
+                auto * dst = ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], 0);
+                res->t_prefill_out = ggml_cpy(ctx0, res->t_prefill_out, dst);
+            }
+            ggml_set_name(res->t_prefill_out, "prefill_output");
+            ggml_build_forward_expand(gf, res->t_prefill_out);
+            return;
         }
-        ggml_set_name(res->t_prefill_out, "prefill_output");
-        ggml_build_forward_expand(gf, res->t_prefill_out);
-        if (last != n_layer || n_outputs == 0) {
+        if (n_outputs == 0) {
+            ggml_build_forward_expand(gf, inpL);
             return;
         }
         if (crop_before_nextn(inp_out_ids)) {

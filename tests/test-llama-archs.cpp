@@ -114,6 +114,7 @@ static void usage(char ** argv) {
     LOG("  --direct-weight-upload   Test direct pinned expert uploads and staging fallbacks\n");
     LOG("  --layered-planner        Test grouped execution and joint planning\n");
     LOG("  --layered-prefix         Test resident hybrid prefix reuse\n");
+    LOG("  --full-layers            Test complete CPU-owned layer/state staging on an explicit GPU\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -528,7 +529,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
         uint32_t ubatch_size = 64, ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_data = nullptr,
-        ggml_type cache_k = GGML_TYPE_F16, int32_t gpu_layers = -1, bool defer_compute = false, bool no_host = false) {
+        ggml_type cache_k = GGML_TYPE_F16, int32_t gpu_layers = -1, bool defer_compute = false,
+        bool no_host = false, bool cpu_owned = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -541,6 +543,10 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (gpu_layers >= 0) {
         model_params.n_gpu_layers = gpu_layers;
     }
+    if (cpu_owned) {
+        model_params.n_gpu_layers = 0;
+        model_params.use_extra_bufts = false;
+    }
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -550,6 +556,11 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.cb_eval_user_data = cb_data;
     ctx_params.type_k = cache_k;
     ctx_params.type_v = cache_k;
+    if (cpu_owned) {
+        ctx_params.offload_kqv = false;
+        ctx_params.op_offload = false;
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
     if (!encode) {
         ctx_params.n_ubatch = ubatch_size;
     }
@@ -649,6 +660,43 @@ static gguf_context_ptr layered_metadata(bool quantized) {
     return metadata;
 }
 
+static void check_prefill_timing(const llama_layered_prefill_stats & stats) {
+    const auto check = [](const llama_layered_prefill_timing & t) {
+        for (double value : {t.total_ms, t.setup_ms, t.memory_ms, t.weight_ms, t.state_upload_ms,
+                t.graph_ms, t.inputs_ms, t.activation_upload_ms, t.compute_ms, t.activation_download_ms,
+                t.output_ms, t.state_download_ms, t.cleanup_ms, t.graph_build_ms, t.graph_measure_ms, t.graph_alloc_ms}) {
+            if (!std::isfinite(value) || value < 0) {
+                throw std::runtime_error("prefill timing contains an invalid duration");
+            }
+        }
+        if (t.accounted_ms() > t.total_ms + 1e-6) {
+            throw std::runtime_error("prefill phase timings overlap");
+        }
+        if (t.graph_build_ms + t.graph_measure_ms + t.graph_alloc_ms > t.graph_ms + 1e-6) {
+            throw std::runtime_error("prefill graph subphases exceed graph wall time");
+        }
+    };
+    check(stats.timing);
+    llama_layered_prefill_timing sum;
+    for (const auto & group : stats.groups) {
+        check(group.timing);
+        sum.add(group.timing);
+    }
+    for (auto field : {&llama_layered_prefill_timing::memory_ms, &llama_layered_prefill_timing::weight_ms,
+            &llama_layered_prefill_timing::state_upload_ms, &llama_layered_prefill_timing::graph_ms,
+            &llama_layered_prefill_timing::inputs_ms, &llama_layered_prefill_timing::activation_upload_ms,
+            &llama_layered_prefill_timing::compute_ms, &llama_layered_prefill_timing::activation_download_ms,
+            &llama_layered_prefill_timing::output_ms, &llama_layered_prefill_timing::state_download_ms}) {
+        if (std::abs(sum.*field - stats.timing.*field) > 1e-6) {
+            throw std::runtime_error("prefill aggregate timing does not match its groups");
+        }
+    }
+    if (sum.total_ms > stats.timing.total_ms + 1e-6 ||
+        sum.cleanup_ms > stats.timing.cleanup_ms + 1e-6) {
+        throw std::runtime_error("prefill group durations exceed total execution time");
+    }
+}
+
 static int test_layered_prefill(size_t seed, float stdev, const char * target_backend,
                                 bool quantized, bool pipeline, int prefetch_mode = 0, uint32_t group_layers = 1,
                                 bool qwen = false, uint32_t slots = 0, bool cpu_non_experts = true,
@@ -669,7 +717,7 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
         { ".*", ggml_backend_cpu_buffer_type() }, { nullptr, nullptr },
     };
     const auto batches = staging_mode >= -1 ? std::vector<uint32_t>{32, 256} :
-        (qwen ? std::vector<uint32_t>{1, 3, 7} : std::vector<uint32_t>{7, 32, 64});
+        (qwen ? std::vector<uint32_t>{1, 3, 7} : std::vector<uint32_t>{7, 32, 64, 97});
     for (uint32_t ubatch : batches) {
         for (ggml_type staging : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
             auto metadata = qwen ? get_gguf_ctx(LLM_ARCH_QWEN35MOE, true) : layered_metadata(quantized);
@@ -771,6 +819,14 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                 pp.max_prefetch_bytes = prefetch_mode == 2 ? 1 : size_t(64) << 20;
             }
             llama_layered_prefill_stats stats;
+            if (qwen) {
+                pp.full_layers = true;
+                if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -1 ||
+                    llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                    throw std::runtime_error("GLM full-layer mode accepted Qwen or changed its state");
+                }
+                pp.full_layers = false;
+            }
             if (devices.empty()) {
                 pp.profile_gpu = true;
                 if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp) != -1 ||
@@ -802,11 +858,33 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             if (llama_prefill_layered(layered.get(), &invalid, 1, pp) != -1) {
                 throw std::runtime_error("layered prefill accepted an invalid token");
             }
+            if (prefetch_mode == 3 && !devices.empty() &&
+                ggml_backend_dev_type(devices[0]) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp, &stats) != -2 ||
+                    llama_memory_seq_pos_max(llama_get_memory(layered.get()), 0) >= 0) {
+                    throw std::runtime_error("impossible current-layer headroom was accepted or changed state");
+                }
+                ++n_cases;
+                continue;
+            }
             if (llama_prefill_layered(layered.get(), tokens.data(), tokens.size(), pp, &stats) != 0) {
                 throw std::runtime_error("layered prefill failed");
             }
             if (stats.memory_plan_reuses + 1 != stats.groups.size()) {
                 throw std::runtime_error("layered prefill did not reuse its batch memory plan");
+            }
+            check_prefill_timing(stats);
+            if (stats.max_indexer_queries > 64) {
+                throw std::runtime_error("layered indexer exceeded its query window");
+            }
+            if (!qwen && (!stats.compact_causal_input || stats.max_backend_segments < 3)) {
+                throw std::runtime_error("layered prefill did not use compact causal inputs and segmented execution");
+            }
+            if (stats.max_indexer_queries && !stats.compact_pool_input) {
+                throw std::runtime_error("windowed indexer did not use compact pool intervals");
+            }
+            if (!qwen && staging == GGML_TYPE_BF16 && stats.f16_indexer_active) {
+                throw std::runtime_error("BF16 staging changed the reference indexer dispatch precision");
             }
             const size_t nv = llama_vocab_n_tokens(llama_model_get_vocab(reference.first.get()));
             std::vector<float> expected(logits.end() - nv, logits.end());
@@ -882,9 +960,16 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
                 throw std::runtime_error("expert uploads did not use the shared-compute overlap path");
             }
             if (stats.pipeline_active &&
-                (stats.transfer_buffer_bytes == 0 || stats.async_output_batches != stats.microbatches ||
+                (stats.transfer_buffer_bytes == 0 ||
+                 stats.async_output_batches != (stats.groups.size() - 1) * ((tokens.size() + ubatch - 1) / ubatch) ||
                  stats.input_prefetches != (stats.groups.size() - 1) * ((tokens.size() + ubatch - 1) / ubatch - 1))) {
                 throw std::runtime_error("layered prefill did not pipeline all activation transfers");
+            }
+            const auto & hp = candidate.first->hparams;
+            const size_t row = ggml_row_size(staging, int64_t(hp.n_embd) * std::max(1u, hp.dsv4_hc_mult));
+            if (stats.activation_write_bytes != (stats.groups.size() - 1) * row * tokens.size() ||
+                stats.activation_read_bytes != stats.activation_write_bytes) {
+                throw std::runtime_error("layered prefill transferred an unused final residual");
             }
             const uint64_t first_layer_bytes = qwen ? stats.expert_copy_bytes / 4 : 0;
             if (stream_weights && gpu && prefetch_mode == 1 &&
@@ -1011,9 +1096,10 @@ static int test_layered_prefill(size_t seed, float stdev, const char * target_ba
             if (!std::isfinite(nmse(expected, actual)) || nmse(expected, actual) > tolerance) {
                 throw std::runtime_error("single-token prefill after failure differs from ordinary decode");
             }
-            LOG("layered prefill: ubatch=%u group=%u staging=%s quantized=%d pipeline=%d prefetch=%u skip=%u staging-mode=%d, logits/state/decode/budgets OK, expert bytes=%" PRIu64 "\n",
+            LOG("layered prefill: ubatch=%u group=%u staging=%s quantized=%d pipeline=%d prefetch=%u skip=%u staging-mode=%d, logits/state/decode/budgets OK, expert bytes=%" PRIu64 ", indexer-window=%u pool-ranges=%d segments=%u\n",
                 ubatch, group_layers, ggml_type_name(staging), quantized, stats.pipeline_active,
-                stats.weight_prefetches, stats.weight_prefetch_skips, pp.test_weight_staging, stats.expert_copy_bytes);
+                stats.weight_prefetches, stats.weight_prefetch_skips, pp.test_weight_staging, stats.expert_copy_bytes,
+                stats.max_indexer_queries, stats.compact_pool_input, stats.max_backend_segments);
             ++n_cases;
         }
     }
@@ -1043,6 +1129,12 @@ static void test_prefill_cost_model() {
     if (!(estimate(grouped, 65536) < estimate(prefetch, 65536))) {
         throw std::runtime_error("cost model failed to prefer grouping for activation-bound input");
     }
+    const double no_boundary = estimate(grouped, 65536);
+    cost.write_bytes_per_ms = 1;
+    if (estimate(grouped, 65536) != no_boundary) {
+        throw std::runtime_error("cost model charged a download for the final residual");
+    }
+    cost.write_bytes_per_ms = 1000000;
     const std::vector<llama_layered_prefill_group> plain = {{0, 1, 0}, {1, 1, 0}};
     const double serial = llama_prefill_estimate(cost, plain, families, weights, 1024, 64, 65536, false);
     const double piped = estimate(plain, 65536);
@@ -1118,7 +1210,7 @@ static int test_joint_prefill(size_t seed, float stdev, const char * target_back
             if (next_layer != 4 ||
                 stats.microbatches != stats.groups.size() * ((tokens.size() + stats.selected_ubatch - 1) / stats.selected_ubatch) ||
                 stats.activation_read_bytes != (stats.groups.size() - 1) * row * tokens.size() ||
-                stats.activation_write_bytes != stats.groups.size() * row * tokens.size() ||
+                stats.activation_write_bytes != (stats.groups.size() - 1) * row * tokens.size() ||
                 llama_memory_seq_pos_max(llama_get_memory(ctx), 0) != (llama_pos) tokens.size() - 1) {
                 throw std::runtime_error("selected plan was not executed or calibration leaked into the prefix");
             }
@@ -1250,6 +1342,202 @@ static std::vector<uint8_t> prefix_state(llama_context * ctx) {
         throw std::runtime_error("failed to save test prefix state");
     }
     return state;
+}
+
+static int test_full_layer_prefill(size_t seed, float stdev, const char * target_backend, bool pipeline) {
+    if (!target_backend) {
+        throw std::runtime_error("full-layer test requires an explicit GPU backend");
+    }
+    auto * target = ggml_backend_dev_by_name(target_backend);
+    const bool gpu = ggml_backend_dev_type(target) != GGML_BACKEND_DEVICE_TYPE_CPU;
+    const std::vector<ggml_backend_dev_t> devices = gpu ? std::vector<ggml_backend_dev_t>{target} :
+        std::vector<ggml_backend_dev_t>{};
+    const bool active_pipeline = pipeline && gpu;
+    uint64_t expected_bytes = 0;
+    size_t single_layer_bytes = 0;
+    for (uint32_t group : {1u, 2u, 4u, 0u}) {
+        for (uint32_t ubatch : {7u, 32u, 97u}) {
+            const auto tokens = get_tokens(ubatch == 97 ? 137 : 52, 128, seed);
+            auto metadata = layered_metadata(true);
+            auto reference = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, {},
+                LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, ubatch, nullptr, nullptr, GGML_TYPE_F16, 0, false, false, true);
+            auto candidate = get_model_and_ctx(metadata.get(), nullptr, seed, stdev, devices,
+                LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, ubatch, nullptr, nullptr, GGML_TYPE_F16, 0, false, false, true);
+            llama_context_params cp = llama_context_default_params();
+            cp.n_ctx = 256;
+            cp.n_ubatch = ubatch;
+            cp.offload_kqv = false;
+            cp.op_offload = false;
+            cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            cp.n_threads = cp.n_threads_batch = 4;
+            cp.n_rs_seq = 3;
+            reference.second.reset(llama_init_from_model(reference.first.get(), cp));
+            candidate.second.reset(llama_init_from_model(candidate.first.get(), cp));
+            if (!candidate.second || !reference.second) {
+                throw std::runtime_error("failed to create full-layer rollback context");
+            }
+            auto * ctx = candidate.second.get();
+            llama_set_embeddings_nextn(reference.second.get(), true, false);
+            llama_set_embeddings_nextn(ctx, true, false);
+            llama_layered_prefill_params params;
+            params.full_layers = true;
+            params.require_gpu = gpu;
+            params.weight_prefetch = false;
+            params.pipeline = pipeline;
+            params.staging_type = GGML_TYPE_F32;
+            params.n_ubatch = ubatch;
+            params.group_layers = group ? group : 1;
+            params.auto_plan = group == 0;
+            if (params.auto_plan) {
+                params.max_transfer_bytes = 0;
+            }
+            params.max_group_layers = 2;
+            const auto expected = native_suffix(reference.first.get(), reference.second.get(), tokens, 0);
+            llama_context_ptr gpu_oracle(llama_init_from_model(candidate.first.get(), cp));
+            if (!gpu_oracle) {
+                throw std::runtime_error("failed to create full-graph GPU oracle");
+            }
+            llama_set_embeddings_nextn(gpu_oracle.get(), true, false);
+            auto oracle_params = params;
+            oracle_params.auto_plan = false;
+            oracle_params.pipeline = false;
+            oracle_params.group_layers = 4;
+            if (llama_prefill_layered(gpu_oracle.get(), tokens.data(), tokens.size(), oracle_params)) {
+                throw std::runtime_error("full-graph GPU oracle failed");
+            }
+            llama_layered_prefill_stats stats;
+            if (llama_prefill_layered(ctx, tokens.data(), tokens.size(), params, &stats)) {
+                throw std::runtime_error("full-layer prefill failed");
+            }
+            check_prefill_timing(stats);
+            const size_t batches = (tokens.size() + ubatch - 1) / ubatch;
+            const size_t boundary_bytes = (stats.groups.size() - 1) * tokens.size() * ggml_row_size(GGML_TYPE_F32, 256*4);
+            if (stats.pipeline_active != active_pipeline || stats.activation_read_bytes != boundary_bytes ||
+                stats.activation_write_bytes != boundary_bytes ||
+                stats.async_output_batches != (active_pipeline ? (stats.groups.size() - 1) * batches : 0) ||
+                stats.input_prefetches != (active_pipeline ? (stats.groups.size() - 1) * (batches - 1) : 0)) {
+                throw std::runtime_error("full-layer pipeline did not stream the actual rollback microbatches");
+            }
+            std::vector<float> actual(llama_get_logits(ctx), llama_get_logits(ctx) + expected.size());
+            const double error = nmse(expected, actual);
+            if (!std::isfinite(error) || error > 1e-4 ||
+                !stats.layer_weight_bytes || stats.state_upload_bytes != stats.state_download_bytes ||
+                (expected_bytes && expected_bytes != stats.layer_weight_bytes)) {
+                LOG_ERR("full-layer NMSE=%g weight bytes=%" PRIu64 " state=%" PRIu64 "/%" PRIu64 "\n",
+                    error, stats.layer_weight_bytes, stats.state_upload_bytes, stats.state_download_bytes);
+                throw std::runtime_error("full-layer logits, transfers or once-only loading differ");
+            }
+            expected_bytes = stats.layer_weight_bytes;
+            const size_t workspace_bytes = stats.peak_compute_bytes;
+            if (group == 1) {
+                for (const auto & planned : stats.groups) {
+                    single_layer_bytes = std::max(single_layer_bytes, planned.expert_bytes);
+                }
+            }
+            if (params.auto_plan) {
+                uint32_t covered = 0;
+                for (const auto & planned : stats.groups) {
+                    if (planned.first_layer != covered || planned.n_layers != 2 ||
+                        !planned.expert_bytes || !planned.state_bytes ||
+                        planned.n_prefetch_layers) {
+                        throw std::runtime_error("automatic full-layer groups do not cover the model");
+                    }
+                    covered += planned.n_layers;
+                }
+                if (covered != 4 || stats.selected_ubatch != ubatch || !stats.capacity_only ||
+                    stats.calibration_probes || stats.calibration_ms || stats.planner_candidates != 1 ||
+                    stats.planner_graphs != stats.groups.size() ||
+                    stats.graph_measurements || stats.graph_builds + stats.graph_reuses != stats.microbatches ||
+                    stats.expert_copy_bytes || stats.expert_layer_loads) {
+                    throw std::runtime_error("full-layer planner did not select an upload-free capacity plan");
+                }
+            }
+            const size_t hidden_count = tokens.size() * llama_model_n_embd_out(candidate.first.get());
+            const float * reference_hidden = llama_get_embeddings_nextn(gpu_oracle.get());
+            const float * candidate_hidden = llama_get_embeddings_nextn(ctx);
+            const double hidden_error = nmse(
+                std::vector<float>(reference_hidden, reference_hidden + hidden_count),
+                std::vector<float>(candidate_hidden, candidate_hidden + hidden_count));
+            if (!std::isfinite(hidden_error) || hidden_error > 1e-4) {
+                LOG_ERR("full-layer hidden NMSE=%g group=%u ubatch=%u\n", hidden_error, group, ubatch);
+                throw std::runtime_error("full-layer MTP prompt hidden states differ");
+            }
+            const auto oracle = prefix_state(reference.second.get());
+            llama_context_ptr replay(llama_init_from_model(candidate.first.get(), cp));
+            if (!replay || llama_state_seq_set_data(replay.get(), oracle.data(), oracle.size(), 0) != oracle.size()) {
+                throw std::runtime_error("failed to restore full-layer CPU decode oracle");
+            }
+            const auto next = native_suffix(candidate.first.get(), replay.get(), {17}, tokens.size());
+            const auto got = native_suffix(candidate.first.get(), ctx, {17}, tokens.size());
+            if (!std::isfinite(nmse(next, got)) || nmse(next, got) > 1e-4) {
+                throw std::runtime_error("CPU decode after full-layer prefill differs");
+            }
+            params.reuse_prefix = true;
+            const auto suffix_expected = native_suffix(candidate.first.get(), replay.get(), {19, 23, 31}, tokens.size() + 1);
+            if (llama_prefill_layered(ctx, std::vector<llama_token>{19, 23, 31}.data(), 3, params, &stats)) {
+                throw std::runtime_error("full-layer prefix reuse failed");
+            }
+            check_prefill_timing(stats);
+            if (stats.pipeline_active != active_pipeline || stats.input_prefetches != 0 ||
+                stats.async_output_batches != (active_pipeline ? stats.groups.size() - 1 : 0) ||
+                stats.activation_read_bytes != stats.activation_write_bytes) {
+                throw std::runtime_error("full-layer pipeline did not handle a suffix shorter than the rollback tail");
+            }
+            actual.assign(llama_get_logits(ctx), llama_get_logits(ctx) + suffix_expected.size());
+            if (!std::isfinite(nmse(suffix_expected, actual)) || nmse(suffix_expected, actual) > 1e-4) {
+                throw std::runtime_error("full-layer prefix suffix logits differ");
+            }
+            for (const auto & entry : candidate.first->tensors_by_name) {
+                if (!ggml_backend_buffer_is_host(entry.second->buffer)) {
+                    throw std::runtime_error("full-layer execution left a device weight binding behind");
+                }
+            }
+            if (params.auto_plan && ubatch == 32) {
+                llama_context_ptr limited(llama_init_from_model(candidate.first.get(), cp));
+                if (!limited) {
+                    throw std::runtime_error("failed to create budget-limited planner context");
+                }
+                llama_set_embeddings_nextn(limited.get(), true, false);
+                auto trial = params;
+                trial.reuse_prefix = false;
+                trial.max_compute_bytes = workspace_bytes - 1;
+                if (llama_prefill_layered(limited.get(), tokens.data(), tokens.size(), trial, &stats) ||
+                    stats.selected_ubatch >= ubatch || stats.selected_ubatch <= cp.n_rs_seq + 1 ||
+                    stats.layer_weight_bytes != expected_bytes || stats.calibration_probes) {
+                    throw std::runtime_error("full-layer workspace budget did not reduce the automatic microbatch");
+                }
+                llama_memory_clear(llama_get_memory(limited.get()), true);
+                trial.max_compute_bytes = params.max_compute_bytes;
+                trial.max_group_expert_bytes = single_layer_bytes;
+                if (llama_prefill_layered(limited.get(), tokens.data(), tokens.size(), trial, &stats) ||
+                    stats.groups.size() != 4 || stats.layer_weight_bytes != expected_bytes) {
+                    throw std::runtime_error("full-layer weight budget did not reduce automatic groups");
+                }
+                const auto saved = prefix_state(ctx);
+                trial = params;
+                trial.max_compute_bytes = 1;
+                if (llama_prefill_layered(ctx, tokens.data(), 1, trial) != -2 || prefix_state(ctx) != saved) {
+                    throw std::runtime_error("full-layer workspace admission changed the cached prefix");
+                }
+                trial = params;
+                trial.n_ubatch = cp.n_rs_seq + 1;
+                if (llama_prefill_layered(ctx, tokens.data(), 1, trial) != -1 || prefix_state(ctx) != saved) {
+                    throw std::runtime_error("full-layer planner accepted an invalid rollback microbatch");
+                }
+            }
+            params.max_expert_bytes = 1;
+            const auto saved = prefix_state(ctx);
+            const int rejected = llama_prefill_layered(ctx, tokens.data(), 1, params);
+            if (rejected != -2 || prefix_state(ctx) != saved) {
+                std::fprintf(stderr, "full-layer rejection: group=%u ubatch=%u status=%d prefix bytes=%zu/%zu\n",
+                    group, ubatch, rejected, saved.size(), prefix_state(ctx).size());
+                throw std::runtime_error("full-layer allocation rejection did not preserve CPU prefix state");
+            }
+            LOG("full layers: group=%u ubatch=%u pipeline=%d NMSE=%g weight bytes=%" PRIu64 ", CPU decode/prefix OK\n",
+                group, ubatch, pipeline, error, expected_bytes);
+        }
+    }
+    return 0;
 }
 
 static int test_prefix_prefill(size_t seed, float stdev, const char * target_backend, ggml_type cache_k, bool qwen = false) {
@@ -2063,6 +2351,7 @@ int main(int argc, char ** argv) {
     bool qwen_prefill = false;
     bool weight_staging = false;
     bool direct_weight_upload = false;
+    bool full_layers = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2070,6 +2359,8 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
+        } else if (strcmp(argv[i], "--full-layers") == 0) {
+            full_layers = true;
         } else if (strcmp(argv[i], "--layered-prefill") == 0) {
             layered_prefill = true;
         } else if (strcmp(argv[i], "--qwen-prefill") == 0) {
@@ -2179,6 +2470,15 @@ int main(int argc, char ** argv) {
             for (int prefetch : {0, 2}) {
                 if (test_layered_prefill(seed, stdev, target_backend, true, false, prefetch, 1, true, 0,
                                         false, true, GGML_TYPE_F16, false, false, -1)) {
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        if (full_layers) {
+            common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
+            for (bool pipeline : {false, true}) {
+                if (test_full_layer_prefill(seed, stdev, target_backend, pipeline)) {
                     return 1;
                 }
             }

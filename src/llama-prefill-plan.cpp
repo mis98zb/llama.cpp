@@ -112,7 +112,10 @@ double llama_prefill_estimate(
                 upload = std::max(upload, begin) +
                     transfer_ms(prefetched * step_count / batches, cost.weight_bytes_per_ms);
             }
-            download = std::max(download, compute) + transfer_ms(count * double(row_bytes), cost.write_bytes_per_ms);
+            download = std::max(download, compute);
+            if (g + 1 < groups.size()) {
+                download += transfer_ms(count * double(row_bytes), cost.write_bytes_per_ms);
+            }
             output_ready[b % 2] = download;
             host = pipeline ? compute : download;
         }

@@ -1290,6 +1290,28 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+std::vector<ggml_tensor *> llama_kv_cache::get_layer_storage(uint32_t first, uint32_t count) const {
+    std::vector<ggml_tensor *> result;
+    for (const auto & layer : layers) {
+        if (layer.il < first || layer.il - first >= count) {
+            continue;
+        }
+        for (auto * tensor : {layer.k, layer.v}) {
+            if (tensor) {
+                result.push_back(tensor);
+            }
+        }
+        for (const auto * streams : {&layer.k_stream, &layer.v_stream}) {
+            for (auto * tensor : *streams) {
+                if (tensor) {
+                    result.push_back(tensor);
+                }
+            }
+        }
+    }
+    return result;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -2944,6 +2966,21 @@ ggml_type llama_kv_cache_context::type_v() const {
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_causal_positions(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->ne[0] == int64_t(n_kv) + ubatch->n_tokens && ubatch->n_seqs == 1);
+    const auto seq = ubatch->seq_id[0][0];
+    const auto & cells = kv->get_cells(seq);
+    auto * positions = static_cast<float *>(dst->data);
+    for (int32_t i = 0; i < n_kv; ++i) {
+        positions[i] = !cells.is_empty(i) && cells.seq_has(i, seq) ? cells.pos_get(i) : -1;
+    }
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && ubatch->seq_id[i][0] == seq);
+        positions[n_kv + i] = ubatch->pos[i];
+    }
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {

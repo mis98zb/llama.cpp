@@ -120,6 +120,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    const llama_ubatch * get_next_ubatch() const;
 
     //
     // llama_memory_hybrid_context
