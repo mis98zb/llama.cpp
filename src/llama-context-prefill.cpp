@@ -1625,6 +1625,9 @@ int llama_context::prefill_layered_run(
         }
         synchronize();
         const int64_t start_us = ggml_time_us();
+        if (params.full_layers && sched_need_reserve) {
+            sched_defer_compute = true;
+        }
         sched_reserve();
         if (output_reserve(1) < 1) {
             throw llama_prefill_resource_error("failed to reserve layered prefill logits");
@@ -1693,7 +1696,8 @@ int llama_context::prefill_layered_run(
                         minimum, params.max_device_bytes));
                 }
             }
-            if (device != backend_cpu) {
+            // Full-layer banks enforce their own allocation headroom below.
+            if (!params.full_layers && device != backend_cpu) {
                 if (spare_experts && !next_experts[il] &&
                     !spare_experts->compatible(model.layers[il], params.expert_slots)) {
                     spare_experts.reset();
@@ -1733,17 +1737,17 @@ int llama_context::prefill_layered_run(
                         throw llama_prefill_resource_error("complete layer exceeds the per-layer weight budget");
                     }
                 }
-                full_weights = std::make_unique<prefill_layer_storage>(device,
-                    prefill_layer_weights(model, il, group.n_layers),
-                    params.max_group_expert_bytes ? params.max_group_expert_bytes : SIZE_MAX,
+                const auto weight_tensors = prefill_layer_weights(model, il, group.n_layers);
+                const auto state_tensors = prefill_layer_state(*hybrid_memory, il, group.n_layers);
+                const size_t weight_budget = params.max_group_expert_bytes ? params.max_group_expert_bytes : SIZE_MAX;
+                full_weights = std::make_unique<prefill_layer_storage>(device, weight_tensors, weight_budget,
                     params.prefetch_headroom_bytes, true, stats.layer_weight_bytes);
                 const size_t weight_bytes = ggml_backend_buffer_get_size(full_weights->buffer.get());
                 if (params.max_group_expert_bytes && weight_bytes > params.max_group_expert_bytes) {
                     throw llama_prefill_resource_error("complete layer group exceeds the configured group budget");
                 }
                 const int64_t state_start = ggml_time_us();
-                full_state = std::make_unique<prefill_layer_storage>(device,
-                    prefill_layer_state(*hybrid_memory, il, group.n_layers), params.max_compute_bytes,
+                full_state = std::make_unique<prefill_layer_storage>(device, state_tensors, params.max_compute_bytes,
                     params.prefetch_headroom_bytes, false, stats.state_upload_bytes);
                 timing.state_upload_ms += (ggml_time_us() - state_start) * 1e-3;
                 const size_t state_bytes = full_state->buffer ? ggml_backend_buffer_get_size(full_state->buffer.get()) : 0;

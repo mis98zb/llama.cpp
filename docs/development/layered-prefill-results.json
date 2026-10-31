@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "experiment_dates": ["2026-10-21", "2026-10-22", "2026-10-25"],
-  "scope": "Local experimental layer-major Qwen3.5 MoE prefill; measurements are not portable GPU performance claims.",
+  "experiment_dates": ["2026-10-21", "2026-10-22", "2026-10-25", "2026-10-30"],
+  "scope": "Local experimental layer-major Qwen3.5 MoE prefill, with a separately scoped GLM full-layer comparison; measurements are not portable GPU performance claims.",
   "implementation_base_commit": "a2005cf9c29135090bf051661fd7eb3fd66f8ffd",
   "environment": {
     "os": "Windows",
@@ -512,6 +512,166 @@
       "No old same-shape logits comparison or corpus quality measurement was performed for this eight-point sweep.",
       "Exact 32000/128000 input counts differ from 32768/131072 used by some external benchmarks.",
       "Raw logs, full commands and final logits remain local; machine-specific artifact paths are excluded."
+    ]
+  },
+  "glm_full_layer_allocation_comparison_2026_10_30": {
+    "scope": "Independent GLM measurement; the top-level Windows/Qwen environment and models do not apply.",
+    "baseline_commit": "c189d866a",
+    "baseline_changes": "Model/context wall-time logging only; no execution changes.",
+    "reuse_measurement_candidate_diff_sha256": "4cb9841f823ab766ed0d691a79fda0837e3c20b9b06a4a081358792f534e4ace",
+    "measured_gated_code_diff_sha256": "c1374b40047781e51eb7d1dcbceaa2f7860cdec845341bba4532b8c195e3d1c8",
+    "diff_hash_command": "git diff --binary -- common examples src tests | sha256sum",
+    "candidate": "Historical deferred initialization plus CPU/CUDA weight/state allocation reuse. Reuse was automatic in B1/B2, then opt-in during C1 measurement. Bank reuse was removed on 2026-10-31; only deferred initialization remains.",
+    "environment": {
+      "os": "Linux 7.0.0-38-generic",
+      "cpu": "Intel Xeon W-2133",
+      "physical_cores": 6,
+      "logical_cpus": 12,
+      "host_ram_gib_rounded": 247,
+      "gpu": "NVIDIA GeForce RTX 3080 20 GiB",
+      "cuda_architecture": 86,
+      "driver": "595.99.02",
+      "cuda_toolkit": "13.3.73",
+      "cxx_compiler": "GCC 15.2.0",
+      "inference_threads": 16,
+      "batch_threads": 16,
+      "cuda_graphs_disabled": true,
+      "gpu_shared": true,
+      "clocks_affinity_and_file_cache_locked": false,
+      "continuous_clock_or_activity_capture": false,
+      "build_or_regression_tests_overlapped_measurements": false
+    },
+    "model": {
+      "name": "Huihui GLM-5.3-Flash abliterated",
+      "quantization": "UD-Q4_K_XL",
+      "first_shard": "GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf",
+      "shard_bytes": [9429984, 49198039392, 49988626464, 48700701504, 49026026912, 2784498048],
+      "total_shard_bytes": 199707322304,
+      "model_sha256_recorded": false,
+      "main_layers": 45
+    },
+    "prompt": {
+      "input_tokens": 200000,
+      "file_bytes": 680007,
+      "sha256": "21d5ba1e6233d7dd649de3e44705691721f1f2d1d8cf624d4b87aa615209a04e",
+      "recipe": "The sky is blue. repeated 39999 times, ending with The capital of France is; same saved input as the historical GLM 200k run.",
+      "quality_workload": "Synthetic repeated text, not a representative corpus."
+    },
+    "settings": {
+      "context_capacity": 202240,
+      "logical_batch": 200000,
+      "microbatch": 2048,
+      "single_layer_groups": 45,
+      "automatic_capacity_planning": true,
+      "max_group_layers": 1,
+      "activation_staging": "F32",
+      "kv_types": ["F16", "F16"],
+      "host_budget_mib": 32768,
+      "compute_budget_mib": 8192,
+      "transfer_budget_mib": 1024,
+      "device_headroom_mib": 512,
+      "load_mode": "none",
+      "generated_tokens": 0,
+      "mtp_hidden_row_export": false,
+      "throughput_excludes_model_and_context_initialization": true
+    },
+    "command_template": [
+      "<variant-bin>/llama-layered-prefill",
+      "--full-layers", "--auto-plan", "--max-group-layers", "1",
+      "--staging-type", "f32", "--host-budget-mib", "32768",
+      "--compute-budget-mib", "8192", "--transfer-budget-mib", "1024",
+      "--device-headroom-mib", "512", "--prompt-tokens", "200000",
+      "--logits-file", "<run>.logits", "-m", "<model-first-shard>",
+      "--device", "CUDA0", "--load-mode", "none",
+      "-c", "202240", "-b", "200000", "-ub", "2048",
+      "-fa", "on", "-ctk", "f16", "-ctv", "f16", "-t", "16", "-tb", "16",
+      "-f", "<saved-prompt>", "-n", "0"
+    ],
+    "command_environment": {"GGML_CUDA_DISABLE_GRAPHS": "1", "LD_LIBRARY_PATH": "<variant-bin>"},
+    "command_notes": "Variant directories contain independent executables and matching shared libraries. Historical B1/B2 require the preserved reuse-enabled executable: the later --reuse-layer-buffers option and its implementation have been removed. Deferred-only C1 is the retained policy. Full expanded commands remain in local run JSON files.",
+    "measurement_order": ["A2", "A3", "4096 baseline", "4096 reuse candidate", "4096 baseline repeat", "B1", "B2", "A4", "final gated-code regression tests", "C1"],
+    "long_input_runs": [
+      {"id": "A2", "variant": "baseline", "prefill_ms": 379383.324, "tokens_per_second": 527.171, "planning_ms": 3850.77, "context_ms": 3165.245, "model_load_ms": 160964.362, "process_wall_seconds": 570.575643104, "weight_load_ms": 26532.711, "compute_wait_ms": 323488.130, "peak_bank_bytes": 5831554048, "allocations_inferred": 90, "reuses_inferred": 0, "logits_sha256": "02f73f34e1242ed1d3446a27131a7a59f4643c110948b2e5e15795cae19f1761"},
+      {"id": "A3", "variant": "baseline", "prefill_ms": 380416.036, "tokens_per_second": 525.740, "planning_ms": 3878.63, "context_ms": 3133.649, "model_load_ms": 162115.888, "process_wall_seconds": 572.945851802, "weight_load_ms": 26520.763, "compute_wait_ms": 324462.865, "peak_bank_bytes": 5831554048, "allocations_inferred": 90, "reuses_inferred": 0, "logits_nmse_vs_A2": 0.009944003681746931, "logits_sha256": "a8f6ee5ad8e9fda70958cb5cabe1e42d28d253bcdfa8c7c5114bb52a96fc9e97"},
+      {"id": "B1", "variant": "deferred_and_reuse", "prefill_ms": 464957.583, "tokens_per_second": 430.147, "planning_ms": 3623.08, "context_ms": 1995.812, "model_load_ms": 151230.204, "process_wall_seconds": 646.471963471, "weight_load_ms": 27929.803, "compute_wait_ms": 405692.745, "peak_bank_bytes": 5915168128, "allocations": 7, "reuses": 83, "logits_nmse_vs_A2": 0.008654419011332327, "logits_sha256": "1284581b475ecba979096e057dc00f36cc535fffc4f7ef3139fe4590a75663fd"},
+      {"id": "B2", "variant": "deferred_and_reuse", "prefill_ms": 418668.501, "tokens_per_second": 477.705, "planning_ms": 3613.25, "context_ms": 1986.369, "model_load_ms": 151078.547, "process_wall_seconds": 598.471184012, "weight_load_ms": 25386.099, "compute_wait_ms": 363183.746, "peak_bank_bytes": 5915168128, "allocations": 7, "reuses": 83, "logits_nmse_vs_A2": 0.018314154585097744, "logits_sha256": "c4b3fca8c52aed7d5ba96d549f6564265c08cf378662c04e2132f2fd50d79ab9"},
+      {"id": "A4", "variant": "baseline", "prefill_ms": 384208.119, "tokens_per_second": 520.551, "planning_ms": 3947.53, "context_ms": 3116.531, "model_load_ms": 151575.925, "process_wall_seconds": 565.727073166, "weight_load_ms": 26364.482, "compute_wait_ms": 328543.700, "peak_bank_bytes": 5831554048, "allocations_inferred": 90, "reuses_inferred": 0, "logits_nmse_vs_A2": 0.007227035118279925, "logits_sha256": "65fa1059d8669f5eea1fd4d44e01ce96fc18a604aada26105c7c5151cc1d1005"},
+      {"id": "C1", "variant": "deferred_only_final_default", "prefill_ms": 380865.521, "tokens_per_second": 525.120, "planning_ms": 3434.66, "context_ms": 1907.855, "model_load_ms": 151336.099, "process_wall_seconds": 560.920725867, "weight_load_ms": 26327.625, "compute_wait_ms": 325463.506, "peak_bank_bytes": 5831554048, "allocations": 90, "reuses": 0, "logits_nmse_vs_A2": 0.008812188210725217, "logits_sha256": "e6c93abbd8b1ac98f25fac7a1096a5ef70f3d269b592a573dc07731c29568c54"}
+    ],
+    "invariant_long_input_transfers": {
+      "weight_upload_bytes": 195118640376,
+      "state_upload_bytes": 4139188224,
+      "state_download_bytes": 4139188224,
+      "activation_upload_bytes": 576716800000,
+      "activation_download_bytes": 576716800000
+    },
+    "short_input_runs": [
+      {"id": "short_A1", "variant": "baseline", "tokens": 4096, "prefill_ms": 49158.360, "tokens_per_second": 83.323, "context_ms": 3390.716, "model_load_ms": 146618.626, "process_wall_seconds": 227.638245487},
+      {"id": "short_B1", "variant": "deferred_and_reuse", "tokens": 4096, "prefill_ms": 44488.743, "tokens_per_second": 92.068, "context_ms": 2027.015, "model_load_ms": 153994.485, "process_wall_seconds": 229.302248475, "allocations": 7, "reuses": 83, "logits_nmse_vs_short_A1": 0.0018717914405279455, "strict_equivalence": "failed"},
+      {"id": "short_A2", "variant": "baseline", "tokens": 4096, "prefill_ms": 49163.833, "tokens_per_second": 83.313, "context_ms": 3296.848, "model_load_ms": 151195.698, "process_wall_seconds": 232.108570574, "logits_nmse_vs_short_A1": 0.003686673406345312, "strict_equivalence": "failed"}
+    ],
+    "numerical_validation": {
+      "final_logits_values": 154880,
+      "type": "F32",
+      "all_measured_arrays_finite": true,
+      "strict_nmse_threshold_unchanged": 0.000001,
+      "long_input_equivalence": "not_established_baseline_nonrepeatable",
+      "baseline_repeat_check": "failed_before_candidate_long_input_runs",
+      "short_input_equivalence": "not_established_baseline_nonrepeatable",
+      "synthetic_same_backend_reuse_comparison_nmse_limit": 0.0000000001,
+      "synthetic_same_backend_serialized_state_equal": true,
+      "real_mtp_smoke": {
+        "prompt": "The capital of France is",
+        "input_tokens": 5,
+        "requested_output_tokens": 32,
+        "actual_output_tokens_both": 35,
+        "stop_reason": "generation budget",
+        "proposed_tokens_both": 39,
+        "accepted_tokens_both": 21,
+        "stdout_byte_identical": true,
+        "stdout_sha256": "2d6c803d41874f27ac19c81552f29513f53e16abae9e8b7b88e13270f0fccef9",
+        "candidate_reuse_enabled_before_opt_in_gating": true,
+        "final_default_retest": {"passed": true, "bank_allocations": 84, "bank_reuses": 0, "groups": 42, "stdout_matches_original_baseline": true, "actual_output_tokens": 35, "accepted_tokens": 21, "proposed_tokens": 39},
+        "caveat": "Existing speculative driver emitted beyond the requested budget. Not a fixed-32-token speed or corpus-quality comparison."
+      }
+    },
+    "validation": [
+      "CPU/CUDA builds of test-llama-archs, llama-layered-prefill and llama-speculative-simple passed.",
+      "ctest --test-dir build-prefill-cpu --output-on-failure -R '^(test-alloc|test-layered-prefill|test-qwen-prefill|test-layered-planner|test-layered-prefix|test-kv-mask)$': 6/6 passed.",
+      "build-prefill-cpu/bin/test-llama-archs --full-layers --seed 42 --backend CPU: passed.",
+      "GGML_CUDA_DISABLE_GRAPHS=1 build-prefill-cuda/bin/test-llama-archs --full-layers --seed 42 --backend CUDA0: passed.",
+      "GGML_CUDA_DISABLE_GRAPHS=1 build-prefill-cuda/bin/test-llama-archs --full-layers --seed 17 --backend CUDA0: passed.",
+      "GGML_CUDA_DISABLE_GRAPHS=1 build-prefill-cuda/bin/test-llama-archs --layered-prefill --seed 42 --backend CUDA0: passed.",
+      "GGML_CUDA_DISABLE_GRAPHS=1 build-prefill-cuda/bin/test-llama-archs --joint-only --seed 42 --backend CUDA0: passed.",
+      "GGML_CUDA_DISABLE_GRAPHS=1 build-prefill-cuda/bin/test-llama-archs --layered-prefix --seed 42 --backend CUDA0: passed."
+    ],
+    "decision": {
+      "deferred_initialization": "Enabled for explicit GLM full-layer example and MTP target. Final default C1 context time 1.908s versus baseline 3.117-3.165s; prefill 380.866s remains within baseline 379.383-384.208s.",
+      "full_layer_bank_reuse": "Removed on 2026-10-31: implementation, API parameter, CLI switch, counters and reuse-only tests. Preserve negative timing and numerical evidence.",
+      "cleanup_performance": "No new performance claim; retained deferred-only policy is the one measured in C1.",
+      "second_bank_upload_worker": "Not added; additional VRAM and concurrency are not justified by these measurements.",
+      "long_context_quality": "Unresolved pre-existing numerical repeatability limitation; no equivalence claim."
+    },
+    "cleanup_verification_2026_10_31": {
+      "removed": ["GLM full-layer allocation cache and rebinding", "bank-reuse API parameter and CLI switch", "allocation/reuse counters", "reuse-only tests"],
+      "retained": ["Deferred initialization", "ordinary/deferred same-backend state and strict logits comparison", "full-layer device-budget tests", "GLM/Qwen execution paths"],
+      "cpu_cuda_builds": "passed",
+      "registered_cpu_tests": "6/6 passed using the same ctest selector recorded above",
+      "cpu_full_layer_seed42": "passed",
+      "cuda_full_layer_seeds": {"42": "passed", "17": "passed"},
+      "cuda_seed42": {"layered-prefill": "passed", "joint-only": "passed", "layered-prefix": "passed"},
+      "source_switch_counter_remnants": "none",
+      "historical_long_input_records_checked_against_raw_json": 6,
+      "new_cleanup_performance_measurement": false
+    },
+    "limitations": [
+      "Shared GPU, no isolated clocks/affinity or continuous hardware trace; timings are local observations, not confidence bounds.",
+      "Not continuous ABBA: short-input checks and correctness tests occurred between some long-input measurements.",
+      "The initial A run had a failed optional backend-path override and is excluded from paired summaries; same-environment repeats also differ numerically.",
+      "An interrupted short baseline has no result and is excluded.",
+      "B1/B2 reduce allocations but increase compute/wait time; the cause is not isolated.",
+      "No MTP hidden rows or generated tokens in 200k prefill measurements; do not compare their state sizes or throughput directly to historical MTP runs.",
+      "Full commands, raw logs, logits, timing files and independent baseline libraries remain local."
     ]
   },
   "conclusions": [

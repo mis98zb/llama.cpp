@@ -1236,7 +1236,7 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
-common_init_result::common_init_result(common_params & params, bool model_only) :
+common_init_result::common_init_result(common_params & params, bool model_only, bool defer_compute) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -1368,7 +1368,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
-    llama_context * lctx = llama_init_from_model(model, cparams);
+    llama_context * lctx = defer_compute ? llama_init_from_model_layered(model, cparams) :
+        llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
@@ -1414,8 +1415,8 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
     }
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only, bool defer_compute) {
+    common_init_result_ptr res(new common_init_result(params, model_only, defer_compute));
 
     llama_model * model = res->model();
     if (model == NULL) {

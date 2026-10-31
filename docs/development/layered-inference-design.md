@@ -33,6 +33,26 @@ This follow-up revision adds the following, with validation and limitations reco
 
 The completed 200000-input/2048-output experiment reached 589.230 seconds of prefill including planning (339.43 tokens/second), versus 815.852 seconds (245.14 tokens/second) for the prior streaming baseline. These are combined single-run results, not isolated component gains. WMMA changes some top-k selections despite byte-identical output on this repetitive workload. Remaining measured costs include 62.679 seconds of graph allocation and 55.111 seconds of input preparation; the final run did not reuse graph objects, only admission results.
 
+### Current GLM keep/remove decisions (2026-10-31)
+
+The following decisions distinguish measured speedups from memory savings, correctness and execution capabilities. A component without an isolated timing comparison is not automatically useless, but must not be advertised as a proven speedup.
+
+| Optimization or capability | Evidence and limitation | Decision |
+| --- | --- | --- |
+| Deferred full-model compute reservation for layered context/MTP target | Context initialization fell from 3.117-3.165 seconds to 1.908 seconds; 200k prefill remained within the baseline range | Keep; startup improvement, not a prefill-throughput claim |
+| Layer-major once-per-layer weight loading and full-layer offload | Every required main-model weight is uploaded once across all microbatches; supports models that cannot reside entirely on the GPU | Keep the execution capability |
+| Single pinned suffix activation array, in-place overwrite and event-protected DMA pipeline | Removes the second complete host array and activation bounce copies; transfers still occur, and GLM's isolated overlap benefit is not measured | Keep bounded storage and transfer correctness; do not claim all DMA is hidden |
+| Final-group residual omission | Avoids an unused complete residual download without dropping final state, logits or MTP hidden rows | Keep |
+| Batch/cache allocation-plan replay and rewind | Avoids repeated batch splitting across groups while preserving layer-specific cache/state; no isolated GLM throughput measurement | Keep shared infrastructure |
+| Metadata-first capacity planner and admitted workspace bounds | Avoids calibration uploads and repeated execution measurements; historical short-input planning dropped from 34.174 to 1.339 seconds | Keep capacity/admission checks; not a fastest-plan guarantee |
+| F16 indexer dispatch and compact selected-index attention | Historical combined prefill improved from 815.852 to 589.230 seconds while microbatch also changed; F16 dispatch affects top-k and is restricted to F32 staging | Keep scoped paths and fallback guards; individual speedups and corpus quality remain unproven |
+| Query windows, compact visibility inputs and graph segmentation | Bounds temporary query scoring and avoids full host mask construction; correctness tested, but isolated GLM speedups/capture benefits are unmeasured | Keep existing bounded-input/scheduling paths; no new acceleration claim |
+| Multiple-layer grouping | Reduces activation boundaries but does not reduce once-only weight bytes; may reduce the microbatch that fits | Keep optional capacity choice, single layer remains the default; not a mandatory speed strategy |
+| Per-call full-layer weight/state bank allocation reuse | 7 allocations/83 reuses versus 90 allocations, but 200k took 464.958/418.669 seconds versus baseline 379.383-384.208 seconds | Remove the implementation, parameter, CLI switch, counters and reuse-only tests |
+| Second full-layer bank and upload worker | Not implemented for GLM; extra VRAM and concurrency have no supporting matched result | Do not add; Qwen's independent staging/worker paths remain unchanged |
+
+The bank-reuse experiment and negative measurements below are retained as historical evidence, not as available options. The remaining GLM path corresponds to the measured deferred-only C1 policy (525.120 tokens/s at 200k on the recorded hardware). Cleanup itself is not a new performance measurement. Real-model logits repeatability remains unresolved and must not be hidden by deleting failed comparisons or increasing tolerances.
+
 ## Terminology
 
 - Main model: the full target transformer used to establish the prompt state and verify generated candidates.
@@ -145,6 +165,8 @@ MTP must receive the correct target hidden states and initialize its prompt hist
 `llama_layered_prefill_params::full_layers` temporarily binds complete CPU-owned layer tensors and their cache storage to device banks. It requires exclusive access to the model while prefill runs. Weights remain CPU-owned outside that call. State is uploaded and returned once per group; the current prototype transfers the group's entire allocated state, including unused cache capacity. This is bounded by context capacity, not by the microbatch size.
 
 Full-layer mode requires CPU cache placement and disabled expert-only prefetch. It reports separate complete-weight and state transfer counters. With `auto_plan`, tensor metadata determines complete weights, current-group state and transfer-buffer capacity. A deterministic greedy pass packs consecutive layers using a workspace reserve, then checks only that plan's real full-context graphs. Dry checks use zero-sized device-placement markers, restore all tensor bindings, and never allocate weight/state device banks, upload weights or run calibration graphs. Plans include the maximum scheduler workspace retained across groups, activation pipeline buffers when enabled and the device safety margin. The per-layer weight limit applies to each complete layer; the optional group limit applies to the entire weight bank. Allocation failures are explicit; execution after state mutation is not transactional.
+
+Each full-layer group allocates its bounded weight/state banks and releases them after computation and state download. Cross-group bank allocation reuse was tested and removed after the negative long-input results below; no bank-reuse parameter, CLI option or counter remains. The standalone example and the MTP target retain deferred context initialization for explicit layered execution, preserving normal sampler and threadpool initialization. Enabling MTP hidden outputs does not reintroduce a full-model worst-case workspace reservation before the first layer group. Ordinary initialization remains unchanged.
 
 This is capacity planning, not measured latency optimization or a minimum-group guarantee. It starts at `n_ubatch` (bounded by suffix length and the rollback minimum) and reserves one quarter of the current device budget for workspace, capped by `max_compute_bytes` and the space remaining after the largest single layer/state bank. This is a packing heuristic, not a hardcoded model-specific workspace bound. The selected plan's dry graphs validate the real scheduler workspace before any weight upload or execution. A larger measured workspace raises the reserve and repacks the groups; other admission failures halve the microbatch. The planner stops at the first validated plan instead of enumerating smaller batches and group caps. Graph checks are cached across corrections. Groups contain at most `max_group_layers` layers (default 4).
 
@@ -337,7 +359,7 @@ The complete-weight upload count remained 195118640376 bytes and state upload/do
 
 Validation passed on the Release SM86 build: `ctest --test-dir build-cuda --output-on-failure -R '^(test-layered-prefill|test-layered-planner|test-layered-prefix|test-alloc)$'` (4/4); full-layer CUDA tests with seeds 42 and 17; existing CUDA layered-prefill, prefix and joint-planner tests with seed 42; `test-backend-ops -b CUDA0 -o LIGHTNING_INDEXER -p 'hsk=128,nh=32.*type_K=f16'` (6/6); compact-index CPU/CUDA comparison including empty single-query rows (28/28); and combined compact/ordinary-mask operator tests (33/33). The real-run verifier checked actual batch size, both active kernel paths, zero execution dry measurements, phase sums, layer coverage, transfer counts and exact output bytes. Backends other than CPU/CUDA were not built locally; their changes only reject the new optional input rather than adding implementations.
 
-### Workspace, query windows, visibility and segmented graphs: validation pending
+### Workspace, query windows, visibility and segmented graphs: initial prototype validation
 
 The previous implementation and measurements are committed in `b5350fd7a`. The next prototype follows the order below. These changes reuse existing ggml storage, arithmetic and CUDA graph mechanisms; no source from the sibling engines is copied.
 
@@ -354,4 +376,47 @@ CPU-only validation passed:
 - `build-prefill-cpu/bin/test-backend-ops -b CPU -o SUB -p 'query_window=64'`: 6/6 passed for complete-versus-windowed scores with 65/97/137 queries and one/two streams.
 - The allocator test checks that explicit boundaries create three same-device segments instead of one while maintaining valid allocations and tensor lifetimes.
 
-The corresponding SM86 CUDA targets compile, but final CUDA execution, actual capture/replay and the new 200k benchmark are blocked by the local driver. A GPU test blocked before producing its first CUDA initialization message, and an independent `nvidia-smi` also blocked in `os_acquire_rwlock_write`. No new model graph had executed when the initialization stalled. Only task-owned clients were stopped; the shared GPU was not reset and other processes were not terminated. The earlier 589.230-second result belongs to `b5350fd7a`, not to this unmeasured prototype. CUDA validation and long-context performance/quality comparisons must be repeated after driver recovery before treating this round as a verified optimization.
+At the original prototype checkpoint, the SM86 CUDA targets compiled but execution and the new 200k benchmark were blocked by the local driver. A GPU test blocked before its first CUDA initialization message, and an independent `nvidia-smi` blocked in `os_acquire_rwlock_write`. No new model graph had executed when initialization stalled. Only task-owned clients were stopped; the shared GPU was not reset and other processes were not terminated. The earlier 589.230-second result belongs to `b5350fd7a`. The driver was responsive during the later integrated-branch validation and measurements below; the original blocked attempt is not a GPU execution result.
+
+### Deferred initialization and full-layer bank reuse (2026-10-30)
+
+The comparison uses the integrated `c189d866a` baseline, with model/context wall-time logging added but no execution changes, and a candidate with deferred target initialization and per-call weight/state bank reuse. Both use the local Huihui GLM-5.3-Flash UD-Q4_K_XL six-shard model, an RTX 3080 20 GiB (SM86), Xeon W-2133 (6 cores/12 logical CPUs), 16 inference/batch threads, Linux, CUDA 13.3 and GCC 15.2. CUDA Graphs are disabled. The GPU is shared; clocks, affinity and file-cache state are not locked.
+
+The 200k comparison fixes microbatch 2048 and single-layer groups (`--auto-plan --max-group-layers 1`). All successful runs must select 2048 and cover all 45 layers once. Context/batch capacities are 202240/200000, KV is F16, activation staging is F32, host/compute/transfer limits are 32768/8192/1024 MiB and device headroom is 512 MiB. The saved 200000-token input has SHA-256 `21d5ba1e6233d7dd649de3e44705691721f1f2d1d8cf624d4b87aa615209a04e`. This is prefill-only (`-n 0`), with no MTP hidden-row export or decode. It is not a matched comparison with the earlier automatic-group 200k/2048-output experiments.
+
+Long-context numerical validation has an existing baseline limitation. Two runs of the unchanged executable in the same loading environment produced 154880 finite final-token F32 logits but differed by NMSE `0.009944003681746931`. Strict `1e-6` comparison rejected them before any candidate measurement. The first separate baseline had a failed optional backend-path override and is excluded from paired timing summaries; the same-environment repeat establishes that removing that override does not remove the logits difference. Timing measurements can still be recorded, but they do not establish 200k logits equivalence or corpus quality. No existing unit-test tolerance is relaxed.
+
+A separate real-model MTP smoke check used `The capital of France is`, context capacity 202240, microbatch ceiling 2048, greedy sampling, draft maximum 3 and requested output budget 32 with EOS ignored. Both versions emitted 35 tokens under the existing driver's budget behavior, accepted 21 of 39 proposed tokens, and returned byte-identical stdout with SHA-256 `2d6c803d41874f27ac19c81552f29513f53e16abae9e8b7b88e13270f0fccef9`. The candidate smoke executable enabled bank reuse before it was made opt-in. This checks the deferred-initialization/MTP/decode handoff, not generation speed or long-context quality.
+
+The final default MTP executable repeated this smoke check after reuse was disabled by default. It reported 84 bank allocations and zero reuses for 42 groups, emitted the same 35 tokens, accepted the same 21 of 39 proposals and matched the original baseline stdout byte-for-byte.
+
+A 4096-token check also failed strict logits equivalence for the unchanged baseline itself: repeat NMSE was `0.003686673406345312`; the reuse candidate versus the first baseline was `0.0018717914405279455`. Final arrays were finite in each case. The baseline prefill times were 49.158/49.164 seconds and the reuse candidate took 44.489 seconds, but one candidate point and the failed baseline repeatability check do not establish a general speedup or quality equivalence.
+
+| 200000-token run | Prefill seconds including planning | Tokens/s | Context initialization seconds | Weight/state allocations / reuses |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline A2 | 379.383 | 527.171 | 3.165 | 90 / 0 |
+| Baseline repeat A3 | 380.416 | 525.740 | 3.134 | 90 / 0 |
+| Deferred + reuse B1 | 464.958 | 430.147 | 1.996 | 7 / 83 |
+| Deferred + reuse B2 | 418.669 | 477.705 | 1.986 | 7 / 83 |
+| Reverse baseline A4 | 384.208 | 520.551 | 3.117 | 90 / 0 |
+| Final default C1: deferred only | 380.866 | 525.120 | 1.908 | 90 / 0 |
+
+Baseline allocation counts in the table follow two allocations for each of the 45 nonempty weight/state groups; the old executable does not expose bank counters. Candidate counts are runtime counters. Retained peak bank storage increased from 5831554048 to 5915168128 bytes. Total weight upload remained 195118640376 bytes; state upload/download remained 4139188224 bytes each; activation upload/download remained 576716800000 bytes each. All runs used exactly 200000 input tokens, microbatch 2048, 45 single-layer groups and zero output tokens.
+
+Bank allocation reuse was real, but it did not reduce long-input wall time: B1/B2 compute/wait took 405.693/363.184 seconds versus 323.488/324.463/328.544 seconds in A2/A3/A4. Weight-loading intervals were 27.930/25.386 seconds versus 26.533/26.521/26.364 seconds. These host intervals do not isolate kernel causes, clocks, memory contention or allocation-address effects. There was no overlapping build or regression test during these measurements, but the shared GPU was not isolated. Do not attribute the short-input gain to all prompt lengths. Bank reuse was first disabled by default, then removed on 2026-10-31; a second full-layer prefetch bank is not justified by these results.
+
+The two same-environment baseline repeats preceded B1/B2, and A4 followed them; the 4096-token checks and correctness tests also ran between some measurements, so this is not a continuous controlled ABBA sequence. Each point used a separate process with ordinary model loading. Model load and process wall times are preserved in [the structured results](layered-prefill-results.json), but are excluded from prefill throughput. Long-context candidate logits were not byte-identical to baseline; their NMSE versus A2 was `0.008654419011332327`/`0.018314154585097744`, while A4 versus A2 was `0.007227035118279925`. The existing numerical repeatability issue remains unresolved.
+
+After making allocation reuse opt-in, a final default run C1 (deferred initialization only) completed in 380.866 seconds at 525.120 tokens/s, within the baseline's 379.383-384.208-second range. Context initialization took 1.908 seconds versus baseline 3.117-3.165 seconds, about 39% less. This is a startup improvement, not evidence of faster steady-state prefill. C1 reported 90 bank allocations and zero reuses, unchanged transfer counts and the baseline 5831554048-byte peak bank. Its final logits versus A2 had NMSE `0.008812188210725217`, so it does not resolve the baseline's quality-validation limitation.
+
+Validation of the measured gated implementation before bank-reuse removal:
+
+- CPU/CUDA builds of `test-llama-archs`, `llama-layered-prefill` and `llama-speculative-simple` passed.
+- `ctest --test-dir build-prefill-cpu --output-on-failure -R '^(test-alloc|test-layered-prefill|test-qwen-prefill|test-layered-planner|test-layered-prefix|test-kv-mask)$'`: 6/6 passed.
+- `build-prefill-cpu/bin/test-llama-archs --full-layers --seed 42 --backend CPU`: passed.
+- `GGML_CUDA_DISABLE_GRAPHS=1 build-prefill-cuda/bin/test-llama-archs --full-layers --seed 42 --backend CUDA0` and the same command with `--seed 17`: passed.
+- `GGML_CUDA_DISABLE_GRAPHS=1 build-prefill-cuda/bin/test-llama-archs --layered-prefill --seed 42 --backend CUDA0`, `--joint-only` and `--layered-prefix` variants: passed.
+
+The measured gated implementation's tests checked allocation/reuse counts, same-backend reused versus uncached serialized state equality and logits NMSE at most `1e-10`, MTP hidden rows, ordinary decode and prefix continuation, budget trimming and failure recovery. Reuse-only cases are removed with the experiment; the remaining full-layer tests compare deferred versus ordinary initialization with the same-backend serialized state and `1e-10` logits checks, and retain MTP/decode/prefix and budget rejection coverage. No CUDA kernel or operator arithmetic is changed by cleanup, and no existing tolerance is relaxed.
+
+Cleanup verification on 2026-10-31 repeated the builds and commands listed above after removing bank reuse: the six registered CPU tests passed (6/6), the explicit CPU full-layer test passed, and CUDA full-layer seeds 42/17 plus layered-prefill, joint-only and layered-prefix passed. The source, tests and example help contain no removed bank-reuse parameter, switch or counter. Historical JSON measurements were checked against the original six long-input run records and remain unchanged. No new performance measurement was made for cleanup.

@@ -985,7 +985,7 @@ common_gguf_info common_get_gguf_info(const std::string & fname);
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
-    common_init_result(common_params & params, bool model_only = false);
+    common_init_result(common_params & params, bool model_only = false, bool defer_compute = false);
     ~common_init_result();
 
     llama_model * model();
@@ -1003,7 +1003,7 @@ private:
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false, bool defer_compute = false);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);

@@ -72,7 +72,7 @@ int main(int argc, char ** argv) {
     llama_context * ctx_tgt = NULL;
 
     // load the target model
-    auto llama_init_tgt = common_init_from_params(params);
+    auto llama_init_tgt = common_init_from_params(params, false, layered_prefill);
 
     model_tgt = llama_init_tgt->model();
     ctx_tgt   = llama_init_tgt->context();

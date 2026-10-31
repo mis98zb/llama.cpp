@@ -228,10 +228,12 @@ int main(int argc, char ** argv) {
         }
         overrides.push_back({nullptr, nullptr});
         mp.tensor_buft_overrides = overrides.data();
+        const int64_t model_start = ggml_time_us();
         llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mp));
         if (!model) {
             throw std::runtime_error("failed to load model");
         }
+        LOG_INF("model load wall=%.3f ms\n", (ggml_time_us() - model_start) * 1e-3);
         auto tokens = common_tokenize(llama_model_get_vocab(model.get()), params.prompt, true);
         if (prompt_tokens) {
             if (tokens.size() < prompt_tokens) {
@@ -267,11 +269,13 @@ int main(int argc, char ** argv) {
                 if (tokens.size() + params.n_predict > cp.n_ctx) {
                     throw std::runtime_error("context cannot hold prompt and requested generation");
                 }
-                llama_context_ptr ctx(pp.stream_weights ?
+                const int64_t context_start = ggml_time_us();
+                llama_context_ptr ctx(pp.stream_weights || pp.full_layers ?
                     llama_init_from_model_layered(model.get(), cp) : llama_init_from_model(model.get(), cp));
                 if (!ctx) {
                     throw std::runtime_error("failed to create the resident context before planning; KV/state eviction is not implemented");
                 }
+                LOG_INF("context initialization wall=%.3f ms\n", (ggml_time_us() - context_start) * 1e-3);
                 pp.n_ubatch = cp.n_ubatch;
                 if (pp.expert_slots && pp.weight_prefetch) {
                     LOG_INF("route-driven mode waits for routing; routed-bank prefetch is disabled, static prefetch remains budgeted\n");

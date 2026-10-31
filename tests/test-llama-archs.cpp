@@ -1372,7 +1372,7 @@ static int test_full_layer_prefill(size_t seed, float stdev, const char * target
             cp.n_threads = cp.n_threads_batch = 4;
             cp.n_rs_seq = 3;
             reference.second.reset(llama_init_from_model(reference.first.get(), cp));
-            candidate.second.reset(llama_init_from_model(candidate.first.get(), cp));
+            candidate.second.reset(llama_init_from_model_layered(candidate.first.get(), cp));
             if (!candidate.second || !reference.second) {
                 throw std::runtime_error("failed to create full-layer rollback context");
             }
@@ -1428,7 +1428,51 @@ static int test_full_layer_prefill(size_t seed, float stdev, const char * target
                 throw std::runtime_error("full-layer logits, transfers or once-only loading differ");
             }
             expected_bytes = stats.layer_weight_bytes;
+            if (group == 1 && ubatch == 32) {
+                llama_context_ptr initialized(llama_init_from_model(candidate.first.get(), cp));
+                if (!initialized) {
+                    throw std::runtime_error("failed to create ordinary full-layer context");
+                }
+                llama_set_embeddings_nextn(initialized.get(), true, false);
+                llama_layered_prefill_stats initialized_stats;
+                if (llama_prefill_layered(initialized.get(), tokens.data(), tokens.size(), params, &initialized_stats) ||
+                    initialized_stats.layer_weight_bytes != stats.layer_weight_bytes ||
+                    prefix_state(initialized.get()) != prefix_state(ctx)) {
+                    throw std::runtime_error("deferred initialization changed full-layer serialized state or weight transfers");
+                }
+                const auto * initialized_logits = llama_get_logits(initialized.get());
+                const double initialized_error = nmse(actual,
+                    std::vector<float>(initialized_logits, initialized_logits + actual.size()));
+                if (!std::isfinite(initialized_error) || initialized_error > 1e-10) {
+                    throw std::runtime_error("deferred initialization differs from ordinary same-backend execution");
+                }
+            }
             const size_t workspace_bytes = stats.peak_compute_bytes;
+            if (gpu && group == 1 && ubatch == 32) {
+                const size_t device_limit = stats.peak_device_bytes;
+                llama_context_ptr capped(llama_init_from_model_layered(candidate.first.get(), cp));
+                if (!capped) {
+                    throw std::runtime_error("failed to create device-budget full-layer context");
+                }
+                llama_set_embeddings_nextn(capped.get(), true, false);
+                auto trial = params;
+                trial.max_device_bytes = 1;
+                if (llama_prefill_layered(capped.get(), tokens.data(), tokens.size(), trial) != -2 ||
+                    llama_memory_seq_pos_max(llama_get_memory(capped.get()), 0) >= 0) {
+                    throw std::runtime_error("full-layer device budget failure changed state");
+                }
+                trial.max_device_bytes = device_limit;
+                llama_layered_prefill_stats capped_stats;
+                if (llama_prefill_layered(capped.get(), tokens.data(), tokens.size(), trial, &capped_stats) ||
+                    capped_stats.peak_device_bytes > device_limit || capped_stats.layer_weight_bytes != expected_bytes) {
+                    throw std::runtime_error("full-layer execution exceeded the admitted device budget");
+                }
+                const auto * capped_logits = llama_get_logits(capped.get());
+                const double capped_error = nmse(actual, std::vector<float>(capped_logits, capped_logits + actual.size()));
+                if (!std::isfinite(capped_error) || capped_error > 1e-4) {
+                    throw std::runtime_error("full-layer device budget changed logits");
+                }
+            }
             if (group == 1) {
                 for (const auto & planned : stats.groups) {
                     single_layer_bytes = std::max(single_layer_bytes, planned.expert_bytes);
